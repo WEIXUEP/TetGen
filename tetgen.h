@@ -671,6 +671,12 @@ public:
   int verbose;                                                     // '-V', 0.
   int nocoarsen;                                                   // '-K', 0.
   int nometricswritten;                                            // '-G', 0.
+  // Existing-mesh optimizer mode: use minratio as the exact volume quality
+  // target instead of the legacy relaxed queue threshold.
+  int exact_refinement_target;
+  // Application-facing refinement budgets count only vertices added by this
+  // invocation. Native -S also counts reconstructed Steiner vertices.
+  int new_point_budget;
   
   // Parameters
   int vertexperblock;                                           // '-x', 4092.
@@ -803,6 +809,8 @@ public:
     verbose = 0;
     nocoarsen = 0;
     nometricswritten = 0;
+    exact_refinement_target = 0;
+    new_point_budget = -1;
 
     vertexperblock = 4092;
     tetrahedraperblock = 8188;
@@ -2572,6 +2580,41 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
 void tetrahedralize(char *switches, tetgenio *in, tetgenio *out,
                     tetgenio *addin = NULL, tetgenio *bgmin = NULL);
 
+// Diagnostics for the restricted existing-mesh optimization entry point.
+// flip22 counts surface diagonal changes, while flip32/flip23 are volume
+// connectivity changes (a constrained flip32 can also perform a flip22).
+struct tetgen_swap_only_stats {
+  long flip22 = 0;
+  long flip23 = 0;
+  long flip32 = 0;
+  long flip44 = 0;
+  long inserted_points = 0;
+};
+
+// Compatibility entry point for fixed-node, flip-only optimization.
+void tetgen_swap_only(tetgenio *in, tetgenio *out,
+                      tetgen_swap_only_stats *stats = NULL);
+// Reconstruct an existing tetrahedral mesh, optionally perform interior-only
+// Delaunay quality refinement under a hard new-point budget, then run native
+// constrained surface/volume flips. Input nodes are fixed and PLC segments
+// and subfaces are never split. The caller must validate returned topology.
+void tetgen_optimize_existing(tetgenio *in, tetgenio *out,
+                              int max_inserted_points,
+                              REAL target_radius_edge_ratio,
+                              REAL target_min_dihedral_degrees,
+                              REAL segment_encroachment_angle_degrees,
+                              REAL facet_encroachment_dihedral_degrees,
+                              REAL target_max_aspect_ratio,
+                              REAL target_max_edge_ratio,
+                              REAL target_max_dihedral_degrees,
+                              int optimization_flip_level,
+                              int optimization_scheme,
+                              int optimization_iterations,
+                              int smoothing_criterion,
+                              int smoothing_iterations,
+                              REAL smoothing_alpha,
+                              tetgen_swap_only_stats *stats = NULL);
+
 #endif // #ifdef TETLIBRARY
 
 //============================================================================//
@@ -3705,4 +3748,3 @@ inline REAL tetgenmesh::norm2(REAL x, REAL y, REAL z)
 
 
 #endif // #ifndef tetgenH
-
