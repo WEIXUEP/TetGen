@@ -32066,6 +32066,7 @@ bool tetgenmesh::move_vertex(point mesh_vert, REAL target[3])
 
 void tetgenmesh::smooth_vertices()
 {
+  const bool debug_movable = (getenv("TETGEN_DEBUG_MOVABLE") != NULL);
   if (!b->quiet) {
     printf("Smoothing vertices...\n");
   }
@@ -32080,13 +32081,35 @@ void tetgenmesh::smooth_vertices()
   point *surf_smpt_list = NULL;
   point *seg_smpt_list = NULL;
   int volcount = 0, faccount = 0, segcount = 0;
+  movable_input_count = 0;
+
+  // Omega_h marks reconstructed volume vertices that are strictly inside a
+  // complete local cavity. They are ordinary VOLVERTEX nodes, not TetGen
+  // Steiner points, but are safe to include in volume smoothing because the
+  // adapter freezes and validates the PLC and artificial cavity shell.
+  const int movable_input_marker = -2147483000;
+  if (in->pointmarkerlist != NULL) {
+    points->traversalinit();
+    point ptloop = pointtraverse();
+    while (ptloop != NULL) {
+      int idx = pointmark(ptloop) - in->firstnumber;
+      if ((pointtype(ptloop) == VOLVERTEX ||
+           pointtype(ptloop) == NREGULARVERTEX) && idx >= 0 &&
+          idx < in->numberofpoints &&
+          in->pointmarkerlist[idx] == movable_input_marker) {
+        movable_input_count++;
+      }
+      ptloop = pointtraverse();
+    }
+  }
+  int volume_smooth_count = st_volref_count + movable_input_count;
 
   // Only use it when we have Steiner points.
   if (st_segref_count > 0) {
     seg_smpt_list = new point[st_segref_count];
   }
-  if (st_volref_count > 0) {
-    smpt_list = new point[st_volref_count];
+  if (volume_smooth_count > 0) {
+    smpt_list = new point[volume_smooth_count];
   }
   if (st_facref_count > 0) {
     surf_smpt_list = new point[st_facref_count];
@@ -32096,7 +32119,12 @@ void tetgenmesh::smooth_vertices()
   point ptloop = pointtraverse();
   while (ptloop != NULL) {
     enum verttype vt = pointtype(ptloop);
-    if (vt == FREEVOLVERTEX) {
+    int idx = pointmark(ptloop) - in->firstnumber;
+    bool movable_input = (vt == VOLVERTEX || vt == NREGULARVERTEX) &&
+        in->pointmarkerlist != NULL && idx >= 0 &&
+        idx < in->numberofpoints &&
+        in->pointmarkerlist[idx] == movable_input_marker;
+    if (vt == FREEVOLVERTEX || movable_input) {
       smpt_list[volcount++] = ptloop;
     } else if (vt == FREEFACETVERTEX) {
       surf_smpt_list[faccount++] = ptloop;
@@ -32106,10 +32134,18 @@ void tetgenmesh::smooth_vertices()
     ptloop = pointtraverse();
   }
 
-  if ((volcount != st_volref_count) ||
+  if ((volcount != volume_smooth_count) ||
       (faccount != st_facref_count) ||
       (segcount != st_segref_count)) {
     terminatetetgen(this, 2);
+  }
+
+  if (debug_movable) {
+    fprintf(stderr,
+        "[tetgen-movable] queued=%d marker_count=%ld free_volume=%ld "
+        "surface=%d segment=%d\n", volcount, movable_input_count,
+        st_volref_count, faccount, segcount);
+    fflush(stderr);
   }
 
   if (b->verbose > 1) {
@@ -32122,8 +32158,8 @@ void tetgenmesh::smooth_vertices()
   REAL *surf_target_list = NULL;
   REAL *seg_target_list = NULL;
 
-  if (st_volref_count > 0) {
-    target_list = new REAL[st_volref_count * 3];
+  if (volume_smooth_count > 0) {
+    target_list = new REAL[volume_smooth_count * 3];
   }
   if (st_facref_count > 0) {
     surf_target_list = new REAL[st_facref_count * 3];
@@ -32182,12 +32218,40 @@ void tetgenmesh::smooth_vertices()
 
     if (((b->smooth_cirterion & 1) > 0)) { // default -s3
       //if (st_volref_count > 0) {
-      for (i = 0; i < st_volref_count; i++) {
+      for (i = 0; i < volume_smooth_count; i++) {
         get_laplacian_center(smpt_list[i], &(target_list[i*3]));
         caveoldtetlist->restart();
+        if (debug_movable &&
+            in->pointmarkerlist != NULL &&
+            (pointtype(smpt_list[i]) == VOLVERTEX ||
+             pointtype(smpt_list[i]) == NREGULARVERTEX)) {
+          int idx = pointmark(smpt_list[i]) - in->firstnumber;
+          if (idx >= 0 && idx < in->numberofpoints &&
+              in->pointmarkerlist[idx] == movable_input_marker) {
+            fprintf(stderr,
+                "[tetgen-movable] target point=%d type=%d "
+                "from=(%.17g,%.17g,%.17g) to=(%.17g,%.17g,%.17g)\n",
+                pointmark(smpt_list[i]), (int) pointtype(smpt_list[i]),
+                smpt_list[i][0], smpt_list[i][1], smpt_list[i][2],
+                target_list[i*3], target_list[i*3+1], target_list[i*3+2]);
+          }
+        }
       }
-      for (i = 0; i < st_volref_count; i++) {
-        if (move_vertex(smpt_list[i], &(target_list[i*3]))) {
+      for (i = 0; i < volume_smooth_count; i++) {
+        bool moved = move_vertex(smpt_list[i], &(target_list[i*3]));
+        if (debug_movable && in->pointmarkerlist != NULL &&
+            (pointtype(smpt_list[i]) == VOLVERTEX ||
+             pointtype(smpt_list[i]) == NREGULARVERTEX)) {
+          int idx = pointmark(smpt_list[i]) - in->firstnumber;
+          if (idx >= 0 && idx < in->numberofpoints &&
+              in->pointmarkerlist[idx] == movable_input_marker) {
+            fprintf(stderr, "[tetgen-movable] move point=%d result=%d "
+                "now=(%.17g,%.17g,%.17g)\n", pointmark(smpt_list[i]),
+                moved ? 1 : 0, smpt_list[i][0], smpt_list[i][1],
+                smpt_list[i][2]);
+          }
+        }
+        if (moved) {
           if (later_unflip_queue->objects > b->unflip_queue_limit) {
             flipconstraints fc;
             recoverdelaunay(fc);
@@ -32231,7 +32295,7 @@ void tetgenmesh::smooth_vertices()
     delete [] surf_target_list;
     delete [] surf_smpt_list;
   }
-  if (st_volref_count > 0) {
+  if (volume_smooth_count > 0) {
     delete [] target_list;
     delete [] smpt_list;
   }
@@ -34082,6 +34146,196 @@ long tetgenmesh::repair_badqual_tets(bool bFlips, bool bCollapse, bool bSteiners
 
 //============================================================================//
 //                                                                            //
+// improve_surface_triangulation()    Improve constrained surface triangles. //
+//                                                                            //
+// Scan ordinary diagonals inside one planar, equally marked PLC patch.  The //
+// surface-only lawsonflip() cannot be used after volume reconstruction since //
+// it does not reconnect tetrahedra.  removeedgebyflips() performs the coupled //
+// subface/volume operation and retains TetGen's constraint eligibility tests.//
+//                                                                            //
+//============================================================================//
+
+long tetgenmesh::improve_surface_triangulation()
+{
+  int t1ver;
+  if (b->nobisect || ((b->cdtrefine & 2) == 0) ||
+      ((b->opt_scheme & 4) == 0)) {
+    return 0;
+  }
+
+  auto triangle_min_cosine = [](point a, point b, point c,
+                                 REAL *mincos) -> bool {
+    point p[3] = {a, b, c};
+    *mincos = 1.0;
+    for (int i = 0; i < 3; ++i) {
+      REAL u[3], v[3];
+      REAL uu = 0.0, vv = 0.0, uv = 0.0;
+      for (int axis = 0; axis < 3; ++axis) {
+        u[axis] = p[(i + 1) % 3][axis] - p[i][axis];
+        v[axis] = p[(i + 2) % 3][axis] - p[i][axis];
+        uu += u[axis] * u[axis];
+        vv += v[axis] * v[axis];
+        uv += u[axis] * v[axis];
+      }
+      if (uu <= 0.0 || vv <= 0.0) return false;
+      REAL cosine = uv / sqrt(uu * vv);
+      if (cosine < *mincos) *mincos = cosine;
+    }
+    return true;
+  };
+  auto triangle_quality = [](point a, point b, point c) -> REAL {
+    REAL ab[3], ac[3], bc[3], cross[3];
+    REAL edge_square_sum = 0.0;
+    for (int axis = 0; axis < 3; ++axis) {
+      ab[axis] = b[axis] - a[axis];
+      ac[axis] = c[axis] - a[axis];
+      bc[axis] = c[axis] - b[axis];
+      edge_square_sum += ab[axis] * ab[axis] + ac[axis] * ac[axis] +
+                         bc[axis] * bc[axis];
+    }
+    cross[0] = ab[1] * ac[2] - ab[2] * ac[1];
+    cross[1] = ab[2] * ac[0] - ab[0] * ac[2];
+    cross[2] = ab[0] * ac[1] - ab[1] * ac[0];
+    REAL double_area = sqrt(cross[0] * cross[0] + cross[1] * cross[1] +
+                            cross[2] * cross[2]);
+    return edge_square_sum > 0.0 ?
+        2.0 * sqrt(3.0) * double_area / edge_square_sum : 0.0;
+  };
+
+  long flipcount = 0;
+  long ordinary_edges = 0, patch_edges = 0, ring_edges = 0;
+  long planar_edges = 0, angle_candidates = 0, located_edges = 0;
+  long valid_stars = 0, volume_rejected = 0;
+  long const maxflips = subfaces->items > 0 ? subfaces->items : 1;
+  for (long pass = 0; pass < maxflips; ++pass) {
+    bool changed = false;
+    face shloop, neighsh, ringsh, checkseg;
+    subfaces->traversalinit();
+    shloop.sh = shellfacetraverse(subfaces);
+    while (shloop.sh != NULL) {
+      shloop.shver = 0;
+      for (int edge = 0; edge < 3 && !changed; ++edge) {
+        sspivot(shloop, checkseg);
+        if (checkseg.sh != NULL) {
+          senextself(shloop);
+          continue;
+        }
+        ++ordinary_edges;
+        spivot(shloop, neighsh);
+        if (neighsh.sh == NULL || neighsh.sh == shloop.sh ||
+            shellmark(neighsh) != shellmark(shloop)) {
+          senextself(shloop);
+          continue;
+        }
+        ++patch_edges;
+        spivot(neighsh, ringsh);
+        if (ringsh.sh != shloop.sh) {
+          senextself(shloop);
+          continue;
+        }
+        ++ring_edges;
+        point pa = sorg(shloop);
+        point pb = sdest(shloop);
+        point pc = sapex(shloop);
+        point pd = sapex(neighsh);
+        if (pc == pd) {
+          senextself(shloop);
+          continue;
+        }
+        REAL scale = 0.0;
+        point quad[4] = {pa, pb, pc, pd};
+        for (int i = 0; i < 4; ++i)
+          for (int j = i + 1; j < 4; ++j) {
+            REAL length = distance(quad[i], quad[j]);
+            if (length > scale) scale = length;
+          }
+        REAL coplanar_tolerance = b->epsilon * scale * scale * scale * 10.0;
+        if (scale <= 0.0 ||
+            fabs(orient3d(pa, pb, pc, pd)) > coplanar_tolerance) {
+          senextself(shloop);
+          continue;
+        }
+        ++planar_edges;
+
+        REAL oldmin0, oldmin1, newmin0, newmin1;
+        if (!triangle_min_cosine(pa, pb, pc, &oldmin0) ||
+            !triangle_min_cosine(pb, pa, pd, &oldmin1) ||
+            !triangle_min_cosine(pc, pd, pb, &newmin0) ||
+            !triangle_min_cosine(pd, pc, pa, &newmin1)) {
+          senextself(shloop);
+          continue;
+        }
+        REAL old_worst_max_angle = oldmin0 < oldmin1 ? oldmin0 : oldmin1;
+        REAL new_worst_max_angle = newmin0 < newmin1 ? newmin0 : newmin1;
+        REAL old_quality0 = triangle_quality(pa, pb, pc);
+        REAL old_quality1 = triangle_quality(pb, pa, pd);
+        REAL new_quality0 = triangle_quality(pc, pd, pb);
+        REAL new_quality1 = triangle_quality(pd, pc, pa);
+        REAL old_worst_quality = old_quality0 < old_quality1 ?
+            old_quality0 : old_quality1;
+        REAL new_worst_quality = new_quality0 < new_quality1 ?
+            new_quality0 : new_quality1;
+        REAL angle_tolerance = b->epsilon * 10.0;
+        if (!(new_worst_max_angle > old_worst_max_angle + angle_tolerance &&
+              new_worst_quality > old_worst_quality + angle_tolerance)) {
+          senextself(shloop);
+          continue;
+        }
+        ++angle_candidates;
+
+        triface flipedge, spintet;
+        stpivot(shloop, flipedge);
+        if (flipedge.tet == NULL) stpivot(neighsh, flipedge);
+        if (flipedge.tet == NULL) {
+          senextself(shloop);
+          continue;
+        }
+        ++located_edges;
+        int starsize = 0;
+        spintet = flipedge;
+        do {
+          ++starsize;
+          fnextself(spintet);
+        } while (spintet.tet != flipedge.tet && starsize <= b->flipstarsize);
+        if (starsize < 3 ||
+            (b->flipstarsize > 0 && starsize > b->flipstarsize)) {
+          senextself(shloop);
+          continue;
+        }
+        ++valid_stars;
+
+        flipconstraints fc;
+        fc.remove_ndelaunay_edge = 0;
+        fc.unflip = 1;
+        fc.checkflipeligibility = 1;
+        if (removeedgebyflips(&flipedge, &fc) == 2) {
+          cavetetlist->restart();
+          ++flipcount;
+          changed = true;
+        } else {
+          ++volume_rejected;
+          cavetetlist->restart();
+          senextself(shloop);
+        }
+      }
+      if (!changed) shloop.sh = shellfacetraverse(subfaces);
+      else break;
+    }
+    if (!changed) break;
+  }
+  if (getenv("TETGEN_DEBUG_SURFACE_FLIP") != NULL) {
+    fprintf(stderr, "[tetgen-surface] ordinary=%ld patch=%ld ring=%ld "
+        "planar=%ld angle=%ld located=%ld star=%ld volume_rejected=%ld "
+        "committed=%ld\n", ordinary_edges, patch_edges, ring_edges,
+        planar_edges, angle_candidates, located_edges, valid_stars,
+        volume_rejected, flipcount);
+    fflush(stderr);
+  }
+  return flipcount;
+}
+
+//============================================================================//
+//                                                                            //
 // improve_mesh()    Mesh improvement.                                        //
 //                                                                            //
 //============================================================================//
@@ -34236,6 +34490,15 @@ void tetgenmesh::improve_mesh()
   if (later_unflip_queue->objects > 0) {
     //recoverdelaunay();
     later_unflip_queue->restart(); // clean it.
+  }
+
+  // Volume improvement can leave a legal but poor diagonal on a planar PLC
+  // patch.  Repair these last so the final surface reflects the final volume
+  // topology, while removeedgebyflips() keeps both meshes connected.
+  long surface_improved_count = improve_surface_triangulation();
+  if (b->verbose && surface_improved_count > 0) {
+    printf("  Improved %ld constrained surface diagonals.\n",
+           surface_improved_count);
   }
 
   if (b->verbose) {
@@ -39271,9 +39534,24 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
     }
   }
 
+  // Input vertices marked by the Omega_h adapter are eligible for volume
+  // smoothing even when this invocation did not create any Steiner points.
+  // Count them before the gate below; smooth_vertices() recounts and filters
+  // them by the reconstructed TetGen vertex type before moving anything.
+  m.movable_input_count = 0;
+  if (in->pointmarkerlist != NULL) {
+    const int movable_input_marker = -2147483000;
+    for (int i = 0; i < in->numberofpoints; ++i) {
+      if (in->pointmarkerlist[i] == movable_input_marker) {
+        ++m.movable_input_count;
+      }
+    }
+  }
+
   if ((b->plc || b->quality) &&
       (b->smooth_maxiter > 0) &&
-      ((m.st_volref_count > 0) || (m.st_facref_count > 0))) {
+      ((m.st_volref_count > 0) || (m.st_facref_count > 0) ||
+          (m.movable_input_count > 0))) {
     m.smooth_vertices(); // m.optimizemesh(ts[0]);
   }
 
@@ -39282,7 +39560,8 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
   if (!b->quiet) {
     if ((b->plc || b->quality) &&
         (b->smooth_maxiter > 0) &&
-        ((m.st_volref_count > 0) || (m.st_facref_count > 0))) {
+        ((m.st_volref_count > 0) || (m.st_facref_count > 0) ||
+            (m.movable_input_count > 0))) {
       printf("Mesh smoothing seconds:  %g\n", ((REAL)(tv[10] - tv[9])) / cps);
     }
   }
