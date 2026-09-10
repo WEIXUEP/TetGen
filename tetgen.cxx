@@ -47,6 +47,24 @@
 #include "tetgen.h"
 #include <climits>
 #include <cfloat>
+#include <algorithm>
+#include <vector>
+
+static void tetgen_read_r2_controls(tetgenbehavior* b)
+{
+  const char* candidate = getenv("TETGEN_R2_CANDIDATE_FRACTION");
+  const char* threshold = getenv("TETGEN_R2_QUALITY_THRESHOLD");
+  if (candidate != NULL) {
+    REAL value = (REAL) strtod(candidate, NULL);
+    if (value >= 0.0 && value <= 1.0 && isfinite(value))
+      b->coarsen_candidate_percent = value;
+  }
+  if (threshold != NULL) {
+    REAL value = (REAL) strtod(threshold, NULL);
+    if (value >= 0.0 && isfinite(value))
+      b->coarsen_quality_threshold = value;
+  }
+}
 
 //== io_cxx ==================================================================//
 //                                                                            //
@@ -18853,6 +18871,9 @@ bool tetgenmesh::valid_constrained_f32(triface* abtets, point pa, point pb)
 //                                                                            //
 //============================================================================//
 
+static REAL coarsen_mean_ratio(tetgenmesh::point pa, tetgenmesh::point pb,
+                               tetgenmesh::point pc, tetgenmesh::point pd);
+
 int tetgenmesh::checkflipeligibility(int fliptype, point pa, point pb, 
                                      point pc, point pd, point pe,
                                      int level, int edgepivot,
@@ -18983,6 +19004,33 @@ int tetgenmesh::checkflipeligibility(int fliptype, point pa, point pb,
       // A 2-to-3 flip.
       if ((pd == fc->remvert) || (pe == fc->remvert)) {
         rejflag = 1;
+      }
+    }
+  }
+
+  if (fc->coarsen_quality_gate && !rejflag) {
+    // Ignore the one temporary output which remains incident to remvert and
+    // is consumed by the recursive edge reduction. Gate every persistent
+    // replacement tetrahedron against the original vertex-star minimum.
+    REAL floor = fc->coarsen_quality_floor;
+    if (fliptype == 1) {
+      if ((pc != dummypoint) && (pd != dummypoint) && (pe != dummypoint) &&
+          ((coarsen_mean_ratio(pe, pd, pb, pc) < floor) ||
+           (coarsen_mean_ratio(pe, pd, pc, pa) < floor))) {
+        rejflag = 1;
+      }
+    } else if ((pa != dummypoint) && (pb != dummypoint) &&
+               (pc != dummypoint) && (pd != dummypoint) &&
+               (pe != dummypoint)) {
+      if (level == 0) {
+        if ((coarsen_mean_ratio(pa, pb, pc, pd) < floor) ||
+            (coarsen_mean_ratio(pb, pa, pc, pe) < floor)) {
+          rejflag = 1;
+        }
+      } else if (edgepivot == 1) {
+        if (coarsen_mean_ratio(pb, pa, pc, pe) < floor) rejflag = 1;
+      } else {
+        if (coarsen_mean_ratio(pa, pb, pc, pd) < floor) rejflag = 1;
       }
     }
   }
@@ -22203,6 +22251,52 @@ int tetgenmesh::reduceedgesatvertex(point startpt, arraypool* endptlist, flipcon
 //                                                                            //
 //============================================================================//
 
+static REAL coarsen_mean_ratio(tetgenmesh::point pa, tetgenmesh::point pb,
+                               tetgenmesh::point pc, tetgenmesh::point pd)
+{
+  REAL sum_edge_sq = 0.0;
+  tetgenmesh::point pts[4] = {pa, pb, pc, pd};
+  for (int i = 0; i < 4; ++i) {
+    for (int j = i + 1; j < 4; ++j) {
+      REAL dx = pts[i][0] - pts[j][0];
+      REAL dy = pts[i][1] - pts[j][1];
+      REAL dz = pts[i][2] - pts[j][2];
+      sum_edge_sq += dx * dx + dy * dy + dz * dz;
+    }
+  }
+  REAL six_volume = fabs(orient3d(pa, pb, pc, pd));
+  if ((six_volume <= 0.0) || (sum_edge_sq <= 0.0)) return 0.0;
+  // Omega_h mean_ratio<3>: 12 * (3 V)^(2/3) / sum(edge^2).
+  return 12.0 * pow(0.5 * six_volume, 2.0 / 3.0) / sum_edge_sq;
+}
+
+static REAL coarsen_triangle_mean_ratio(tetgenmesh::point pa,
+                                        tetgenmesh::point pb,
+                                        tetgenmesh::point pc)
+{
+  REAL ab[3], ac[3], cross[3];
+  REAL sum_edge_sq = 0.0;
+  tetgenmesh::point pts[3] = {pa, pb, pc};
+  for (int i = 0; i < 3; ++i) {
+    int j = (i + 1) % 3;
+    REAL dx = pts[i][0] - pts[j][0];
+    REAL dy = pts[i][1] - pts[j][1];
+    REAL dz = pts[i][2] - pts[j][2];
+    sum_edge_sq += dx * dx + dy * dy + dz * dz;
+  }
+  for (int i = 0; i < 3; ++i) {
+    ab[i] = pb[i] - pa[i];
+    ac[i] = pc[i] - pa[i];
+  }
+  cross[0] = ab[1] * ac[2] - ab[2] * ac[1];
+  cross[1] = ab[2] * ac[0] - ab[0] * ac[2];
+  cross[2] = ab[0] * ac[1] - ab[1] * ac[0];
+  REAL twice_area = sqrt(cross[0] * cross[0] + cross[1] * cross[1] +
+      cross[2] * cross[2]);
+  if ((twice_area <= 0.0) || (sum_edge_sq <= 0.0)) return 0.0;
+  return 2.0 * sqrt(3.0) * twice_area / sum_edge_sq;
+}
+
 int tetgenmesh::removevertexbyflips(point steinerpt, flipconstraints &fc)
 {
   triface *fliptets = NULL, wrktets[4];
@@ -22499,6 +22593,39 @@ int tetgenmesh::removevertexbyflips(point steinerpt, flipconstraints &fc)
 
   if (!removeflag) {
     return 0;
+  }
+
+  if (fc.coarsen_quality_gate && (vt == FREEFACETVERTEX)) {
+    // The edge-reduction phase is constrained by checkflipeligibility().
+    // Validate the terminal native 4-to-1 or 6-to-2 replacement before it
+    // mutates the surface and volume complexes.
+    REAL final_minimum = 1.0;
+    if (loc == INTETRAHEDRON) {
+      // A FREEFACETVERTEX reaching the volume-style 4-to-1 configuration
+      // needs a separate surface 3-to-1 quality proof. Keep it unchanged
+      // rather than accepting a deletion based only on volume quality.
+      return 0;
+    } else if (loc == ONFACE) {
+      // The native 6-to-2 operation creates [a,b,c,d] and [b,a,c,e].
+      triface nexttet, acrosstet;
+      fnext(searchtet, nexttet);
+      eprev(searchtet, acrosstet);
+      fnextself(acrosstet);
+      esymself(acrosstet);
+      eprevself(acrosstet); // [e,p,a,b]
+      point pa = apex(searchtet);
+      point pb = oppo(searchtet);
+      point pc = oppo(nexttet);
+      point pd = dest(searchtet);
+      point pe = org(acrosstet);
+      final_minimum = std::min(coarsen_mean_ratio(pa, pb, pc, pd),
+                               coarsen_mean_ratio(pb, pa, pc, pe));
+      if (coarsen_triangle_mean_ratio(pa, pb, pc) <
+          fc.coarsen_surface_quality_floor) return 0;
+    } else {
+      return 0;
+    }
+    if (final_minimum < fc.coarsen_quality_floor) return 0;
   }
 
   if (vt == FREESEGVERTEX) {
@@ -22885,6 +23012,84 @@ int tetgenmesh::removevertexbyflips(point steinerpt, flipconstraints &fc)
   }
 
   return 1;
+}
+
+//============================================================================//
+//                                                                            //
+// removefacetvertexbyquality()  Quality-gated native surface point removal. //
+//                                                                            //
+// The topology operation remains TetGen's removevertexbyflips(). R2 only     //
+// supplies a strict lower bound derived from the original vertex star.       //
+//                                                                            //
+//============================================================================//
+
+bool tetgenmesh::removefacetvertexbyquality(point rempt)
+{
+  verttype original_type = pointtype(rempt);
+  if ((original_type != FACETVERTEX) &&
+      (original_type != FREEFACETVERTEX)) return false;
+
+  REAL quality_before = 1.0;
+  REAL surface_quality_before = 1.0;
+  int quality_count = 0;
+  int surface_quality_count = 0;
+  getvertexstar(1, rempt, cavetetlist, NULL, NULL);
+  for (int i = 0; i < cavetetlist->objects; ++i) {
+    triface* tet = (triface*) fastlookup(cavetetlist, i);
+    if ((tet == NULL) || isdeadtet(*tet) || ishulltet(*tet)) continue;
+    point* tetpts = (point*) &(tet->tet[4]);
+    quality_before = std::min(quality_before, coarsen_mean_ratio(
+        tetpts[0], tetpts[1], tetpts[2], tetpts[3]));
+    quality_count++;
+  }
+  cavetetlist->restart();
+  if (quality_count == 0) return false;
+
+  subfaces->traversalinit();
+  face subface;
+  subface.shver = 0;
+  subface.sh = shellfacetraverse(subfaces);
+  while (subface.sh != (shellface*) NULL) {
+    point pa = sorg(subface);
+    point pb = sdest(subface);
+    point pc = sapex(subface);
+    if ((pa == rempt) || (pb == rempt) || (pc == rempt)) {
+      surface_quality_before = std::min(surface_quality_before,
+          coarsen_triangle_mean_ratio(pa, pb, pc));
+      surface_quality_count++;
+    }
+    subface.sh = shellfacetraverse(subfaces);
+  }
+  if (surface_quality_count == 0) return false;
+
+  flipconstraints fc;
+  // R2 is terminal. Do not enqueue an unconstrained Lawson pass after the
+  // quality-gated removal, since it could invalidate this point's local gate.
+  fc.enqflag = 0;
+  fc.unflip = 1;
+  fc.coarsen_quality_gate = 1;
+  REAL tolerance = 64.0 * b->epsilon;
+  // A surface operation is accepted for a strict surface-quality gain while
+  // preserving the old volume-star minimum within floating-point tolerance.
+  fc.coarsen_quality_floor = quality_before * (1.0 - tolerance);
+  fc.coarsen_surface_quality_floor =
+      surface_quality_before * (1.0 + tolerance);
+  // TetGen's native deletion distinguishes input facet vertices from Steiner
+  // facet vertices even though both are constrained by the same subface PLC.
+  // R2 deliberately permits a facet-interior input vertex to be removed; the
+  // subfaces still prevent it from crossing a CAD or material boundary.
+  if (original_type == FACETVERTEX) setpointtype(rempt, FREEFACETVERTEX);
+  bool removed = removevertexbyflips(rempt, fc) != 0;
+  if (original_type == FACETVERTEX) {
+    if (removed) {
+      // removevertexbyflips() accounted for a Steiner facet vertex because of
+      // the temporary type. This was an input vertex, so cancel that change.
+      st_facref_count++;
+    } else {
+      setpointtype(rempt, FACETVERTEX);
+    }
+  }
+  return removed;
 }
 
 //============================================================================//
@@ -26515,11 +26720,14 @@ void tetgenmesh::collectremovepoints(arraypool *remptlist)
              b->coarsen_percent * 100.0);
     }
     arraypool *intptlist = new arraypool(sizeof(point *), 10);
+    long r2_type_counts[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     // Count the total number of interior points.
     points->traversalinit();
     ptloop = pointtraverse();
     while (ptloop != NULL) {
       vt = pointtype(ptloop);
+      if (b->coarsen_param == 2 && (int) vt >= 0 && (int) vt < 10)
+        r2_type_counts[(int) vt]++;
       if (vt != RIDGEVERTEX) {
         if (b->nobisect) { // -Y
           // Do not remove boundary vertices.
@@ -26542,14 +26750,145 @@ void tetgenmesh::collectremovepoints(arraypool *remptlist)
       }
       ptloop = pointtraverse();
     }
-    if (intptlist->objects > 0l) {
+    if (intptlist->objects > 0l && b->coarsen_param == 2) {
+      if (getenv("TETGEN_DEBUG_R2") != NULL) {
+        fprintf(stderr,
+            "[tetgen-r2-types] unused=%ld duplicated=%ld ridge=%ld "
+            "facet=%ld volume=%ld free-segment=%ld free-facet=%ld "
+            "free-volume=%ld nonregular=%ld dead=%ld\n",
+            r2_type_counts[0], r2_type_counts[1], r2_type_counts[2],
+            r2_type_counts[3], r2_type_counts[4], r2_type_counts[5],
+            r2_type_counts[6], r2_type_counts[7], r2_type_counts[8],
+            r2_type_counts[9]);
+      }
+      struct coarsen_candidate {
+        point p;
+        REAL priority_quality;
+        REAL minimum_quality;
+        REAL lower_tail_quality;
+        REAL maximum_edge_ratio;
+        int poor_tet_count;
+        std::vector<REAL> star_qualities;
+      };
+      std::vector<coarsen_candidate> candidates;
+      candidates.reserve(intptlist->objects);
+      long supported_count = 0;
+      for (int i = 0; i < intptlist->objects; ++i) {
+        point p = *(point*) fastlookup(intptlist, i);
+        verttype candidate_type = pointtype(p);
+        if ((candidate_type != VOLVERTEX) &&
+            (candidate_type != FREEVOLVERTEX) &&
+            (candidate_type != FACETVERTEX) &&
+            (candidate_type != FREEFACETVERTEX)) continue;
+        supported_count++;
+        REAL worst_edge = 0.0;
+        REAL minimum_quality = 1.0;
+        REAL surface_minimum_quality = 1.0;
+        REAL quality_sum = 0.0;
+        int quality_count = 0;
+        std::vector<REAL> star_qualities;
+        getvertexstar(1, p, cavetetlist, NULL, NULL);
+        for (int j = 0; j < cavetetlist->objects; ++j) {
+          triface* tet = (triface*) fastlookup(cavetetlist, j);
+          if (tet == NULL || isdeadtet(*tet) || ishulltet(*tet)) continue;
+          badface bf;
+          if (!get_tetqual(tet, NULL, &bf)) continue;
+          worst_edge = std::max(worst_edge, bf.cent[2]);
+          point* tetpts = (point*) &(tet->tet[4]);
+          REAL quality = coarsen_mean_ratio(
+              tetpts[0], tetpts[1], tetpts[2], tetpts[3]);
+          minimum_quality = std::min(minimum_quality, quality);
+          quality_sum += quality;
+          quality_count++;
+          star_qualities.push_back(quality);
+        }
+        cavetetlist->restart();
+        if (quality_count > 0) {
+          if ((candidate_type == FACETVERTEX) ||
+              (candidate_type == FREEFACETVERTEX)) {
+            subfaces->traversalinit();
+            face subface;
+            subface.shver = 0;
+            subface.sh = shellfacetraverse(subfaces);
+            while (subface.sh != (shellface*) NULL) {
+              point pa = sorg(subface);
+              point pb = sdest(subface);
+              point pc = sapex(subface);
+            if ((pa == p) || (pb == p) || (pc == p)) {
+              surface_minimum_quality = std::min(surface_minimum_quality,
+                  coarsen_triangle_mean_ratio(pa, pb, pc));
+            }
+              subface.sh = shellfacetraverse(subfaces);
+            }
+          }
+          int poor_tet_count = 0;
+          REAL local_tail_limit = std::min(1.0, 1.5 * minimum_quality);
+          for (size_t j = 0; j < star_qualities.size(); ++j) {
+            if (star_qualities[j] <= local_tail_limit) poor_tet_count++;
+          }
+          REAL priority_quality =
+              ((candidate_type == FACETVERTEX) ||
+               (candidate_type == FREEFACETVERTEX)) ?
+              std::min(minimum_quality, surface_minimum_quality) :
+              minimum_quality;
+          candidates.push_back({p, priority_quality, minimum_quality,
+              quality_sum / quality_count, worst_edge, poor_tet_count,
+              star_qualities});
+        }
+      }
+      b->coarsen_eligible_count = supported_count;
+      // The candidate fraction is relative to all supported volume and
+      // facet-interior points, not only the subset whose quality passes the
+      // optional cutoff. Curve and corner vertices remain protected.
+      REAL candidate_fraction = b->coarsen_candidate_percent;
+      if (!(candidate_fraction >= 0.0) || !isfinite(candidate_fraction))
+        candidate_fraction = 0.05;
+      candidate_fraction = std::min((REAL) 1.0, candidate_fraction);
+      REAL quality_threshold = b->coarsen_quality_threshold;
+      if (!(quality_threshold >= 0.0) || !isfinite(quality_threshold))
+        quality_threshold = 0.1;
+      candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+          [quality_threshold](coarsen_candidate const& c) {
+            return !(c.priority_quality < quality_threshold);
+          }), candidates.end());
+      std::sort(candidates.begin(), candidates.end(),
+          [](coarsen_candidate const& a, coarsen_candidate const& b) {
+            if (a.priority_quality != b.priority_quality)
+              return a.priority_quality < b.priority_quality;
+            if (a.minimum_quality != b.minimum_quality)
+              return a.minimum_quality < b.minimum_quality;
+            if (a.poor_tet_count != b.poor_tet_count)
+              return a.poor_tet_count > b.poor_tet_count;
+            if (a.lower_tail_quality != b.lower_tail_quality)
+              return a.lower_tail_quality < b.lower_tail_quality;
+            return a.maximum_edge_ratio > b.maximum_edge_ratio;
+          });
+      size_t target_candidates = static_cast<size_t>(std::ceil(
+          candidate_fraction * static_cast<REAL>(b->coarsen_eligible_count)));
+      if (target_candidates == 0 && candidate_fraction > 0.0 &&
+          b->coarsen_eligible_count > 0) target_candidates = 1;
+      if (candidates.size() > target_candidates)
+        candidates.resize(target_candidates);
+      // Return the whole priority queue. meshcoarsening() counts successful
+      // transactional removals against the requested fraction, so rejected
+      // high-priority candidates can fall through to the next candidate.
+      point* parypt;
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        point p = candidates[i].p;
+        if (!pinfected(p)) {
+          pinfect(p);
+          remptlist->newindex((void **) &parypt);
+          *parypt = p;
+        }
+      }
+    } else if (intptlist->objects > 0l) {
       // Sort the list of points randomly.
       point *parypt_i, swappt;
       int randindex, i;
       srand(int(intptlist->objects));
       for (i = 0; i < intptlist->objects; i++) {
         randindex = rand() % (i + 1); // randomnation(i + 1);
-        parypt_i = (point *) fastlookup(intptlist, i); 
+        parypt_i = (point *) fastlookup(intptlist, i);
         parypt = (point *) fastlookup(intptlist, randindex);
         // Swap this two points.
         swappt = *parypt_i;
@@ -26598,6 +26937,63 @@ void tetgenmesh::meshcoarsening()
     if (remptlist->objects > 0l) {
       printf("  Removing %ld points...\n", remptlist->objects);
     }
+  }
+
+  if (b->coarsen_param == 2) {
+    long target = (long) ((REAL) b->coarsen_eligible_count *
+        b->coarsen_percent);
+    if ((target == 0) && (b->coarsen_percent > 0.0) &&
+        (remptlist->objects > 0)) target = 1;
+    long attempts = 0;
+    long committed = 0;
+    long volume_committed = 0;
+    long surface_committed = 0;
+    for (long i = 0; (i < remptlist->objects) && (committed < target); ++i) {
+      point* parypt = (point*) fastlookup(remptlist, i);
+      verttype candidate_type = pointtype(*parypt);
+      if (candidate_type == UNUSEDVERTEX) continue;
+      attempts++;
+      bool accepted = false;
+      if ((candidate_type == VOLVERTEX) ||
+          (candidate_type == FREEVOLVERTEX)) {
+        accepted = collapsevertexbyquality(*parypt);
+        if (accepted) volume_committed++;
+      } else if ((candidate_type == FACETVERTEX) ||
+                 (candidate_type == FREEFACETVERTEX)) {
+        accepted = removefacetvertexbyquality(*parypt);
+        if (accepted) surface_committed++;
+      }
+      if (getenv("TETGEN_DEBUG_R2_CANDIDATES") != NULL) {
+        fprintf(stderr, "[tetgen-r2-candidate] mark=%d type=%d accepted=%d\n",
+            pointmark(*parypt), (int) candidate_type, accepted ? 1 : 0);
+      }
+      if (accepted) committed++;
+    }
+    if (b->verbose) {
+      printf("  R2 quality coarsening: candidates=%ld, attempts=%ld, "
+             "committed=%ld (volume=%ld, surface=%ld), target=%ld.\n",
+             remptlist->objects, attempts, committed, volume_committed,
+             surface_committed, target);
+    }
+      if (getenv("TETGEN_DEBUG_R2") != NULL) {
+        fprintf(stderr,
+          "[tetgen-r2] eligible=%ld candidates=%ld attempts=%ld committed=%ld "
+          "volume_committed=%ld surface_committed=%ld target=%ld "
+          "candidate_fraction=%g quality_threshold=%g\n",
+          b->coarsen_eligible_count, remptlist->objects, attempts, committed,
+          volume_committed, surface_committed, target,
+          b->coarsen_candidate_percent, b->coarsen_quality_threshold);
+        // A full consistency walk is intentionally opt-in.  check_mesh()
+        // prints one line for every infected tetrahedron, which is too noisy
+        // for normal R2 diagnostics and adds another O(number of tets) pass.
+        if (getenv("TETGEN_DEBUG_R2_CHECK") != NULL) {
+          int horrors = check_mesh(0);
+          fprintf(stderr, "[tetgen-r2] post-coarsen consistency=%d\n", horrors);
+        }
+        fflush(stderr);
+      }
+    delete remptlist;
+    return;
   }
 
   point *parypt, *plastpt;
@@ -33253,11 +33649,18 @@ bool tetgenmesh::is_edge_collapsible(triface *check_edge, REAL* lambda)
 //                                                                            //
 //============================================================================//
 
-bool tetgenmesh::collapse_edge_to_improve(triface *short_edge, REAL in_asp, REAL in_cosmaxd)
+bool tetgenmesh::collapse_edge_to_improve(triface *short_edge, REAL in_asp,
+                                          REAL in_cosmaxd,
+                                          int allow_input_volume_vertex)
 {
   REAL lambda = 1.0; // default pb is fixed (do not move).
 
-  if ((in_asp > 0.) || (in_cosmaxd >= -1.)) {
+  if (allow_input_volume_vertex) {
+    enum verttype vt = pointtype(org(*short_edge));
+    if ((vt != VOLVERTEX) && (vt != FREEVOLVERTEX)) return false;
+    // R2 always removes the origin and leaves the destination fixed.
+    lambda = 1.0;
+  } else if ((in_asp > 0.) || (in_cosmaxd >= -1.)) {
     if (!is_edge_collapsible(short_edge, &lambda)) {
       return false;
     }
@@ -33486,6 +33889,132 @@ bool tetgenmesh::collapse_edge_to_improve(triface *short_edge, REAL in_asp, REAL
 
 
   return true; // contracted.
+}
+
+//============================================================================//
+//                                                                            //
+// collapsevertexbyquality()  Transactional R2 volume-vertex removal.        //
+//                                                                            //
+// The complete vertex star is the transaction cavity.  Its tetrahedra and   //
+// implied faces/edges remain untouched while every incident edge collapse is //
+// simulated.  Only the destination producing a strict local mean-ratio      //
+// improvement and preserving every tetrahedron orientation is committed.     //
+// Hence a rejected candidate needs no pointer-level restoration.             //
+//                                                                            //
+//============================================================================//
+
+bool tetgenmesh::collapsevertexbyquality(point rempt)
+{
+  int t1ver;
+  enum verttype vt = pointtype(rempt);
+  if ((vt != VOLVERTEX) && (vt != FREEVOLVERTEX)) return false;
+
+  struct cavitytet {
+    point p[4];
+    REAL orientation;
+  };
+  std::vector<cavitytet> cavity;
+  std::vector<point> neighbors;
+  REAL quality_before = 1.0;
+
+  getvertexstar(1, rempt, cavetetlist, cavetetvertlist, NULL);
+  cavity.reserve(cavetetlist->objects);
+  neighbors.reserve(cavetetvertlist->objects);
+  for (int i = 0; i < cavetetlist->objects; ++i) {
+    triface* tet = (triface*) fastlookup(cavetetlist, i);
+    point* tetpts = (point*) &(tet->tet[4]);
+    cavitytet saved;
+    for (int j = 0; j < 4; ++j) saved.p[j] = tetpts[j];
+    saved.orientation = orient3d(
+        saved.p[0], saved.p[1], saved.p[2], saved.p[3]);
+    quality_before = std::min(quality_before, coarsen_mean_ratio(
+        saved.p[0], saved.p[1], saved.p[2], saved.p[3]));
+    cavity.push_back(saved);
+  }
+  for (int i = 0; i < cavetetvertlist->objects; ++i) {
+    point* neighbor = (point*) fastlookup(cavetetvertlist, i);
+    if ((*neighbor != dummypoint) && (*neighbor != rempt))
+      neighbors.push_back(*neighbor);
+  }
+  cavetetlist->restart();
+  cavetetvertlist->restart();
+
+  point best_neighbor = NULL;
+  REAL best_minimum = quality_before;
+  REAL best_average = 0.0;
+  REAL tolerance = 64.0 * b->epsilon;
+
+  for (size_t ni = 0; ni < neighbors.size(); ++ni) {
+    point keeppt = neighbors[ni];
+    enum verttype keep_type = pointtype(keeppt);
+    if ((keep_type != VOLVERTEX) && (keep_type != FREEVOLVERTEX)) continue;
+    triface edge;
+    edge.tet = NULL;
+    if (!getedge(rempt, keeppt, &edge)) continue;
+
+    // A volume collapse must not remove or retriangulate a PLC subface.
+    bool constrained_edge = false;
+    triface spin = edge;
+    do {
+      if (issubface(spin) || issubseg(spin)) {
+        constrained_edge = true;
+        break;
+      }
+      fnextself(spin);
+    } while (spin.tet != edge.tet);
+    if (constrained_edge) continue;
+
+    REAL minimum = 1.0;
+    REAL sum = 0.0;
+    int count = 0;
+    bool valid = true;
+    for (size_t ti = 0; ti < cavity.size(); ++ti) {
+      cavitytet const& oldtet = cavity[ti];
+      bool contains_keeppt = false;
+      point replacement[4];
+      for (int j = 0; j < 4; ++j) {
+        if (oldtet.p[j] == keeppt) contains_keeppt = true;
+        replacement[j] = (oldtet.p[j] == rempt) ? keeppt : oldtet.p[j];
+      }
+      if (contains_keeppt) continue; // Removed edge-star tetrahedron.
+      REAL orientation = orient3d(replacement[0], replacement[1],
+                                  replacement[2], replacement[3]);
+      if ((orientation == 0.0) ||
+          ((orientation > 0.0) != (oldtet.orientation > 0.0))) {
+        valid = false;
+        break;
+      }
+      REAL quality = coarsen_mean_ratio(replacement[0], replacement[1],
+                                        replacement[2], replacement[3]);
+      if (quality <= 0.0) {
+        valid = false;
+        break;
+      }
+      minimum = std::min(minimum, quality);
+      sum += quality;
+      count++;
+    }
+    if (!valid || (count == 0)) continue;
+    REAL average = sum / count;
+    if (minimum <= quality_before * (1.0 + tolerance)) continue;
+    if ((best_neighbor == NULL) ||
+        (minimum > best_minimum * (1.0 + tolerance)) ||
+        ((fabs(minimum - best_minimum) <= tolerance * best_minimum) &&
+         (average > best_average))) {
+      best_neighbor = keeppt;
+      best_minimum = minimum;
+      best_average = average;
+    }
+  }
+
+  if (best_neighbor == NULL) return false;
+  triface bestedge;
+  bestedge.tet = NULL;
+  if (!getedge(rempt, best_neighbor, &bestedge)) return false;
+  // The preflight above is the quality transaction.  These sentinel quality
+  // arguments suppress the older aspect/dihedral sampler; the destination is
+  // fixed and the exact replacement cavity has already been validated.
+  return collapse_edge_to_improve(&bestedge, 0.0, -2.0, 1);
 }
 
 //============================================================================//
@@ -36354,6 +36883,15 @@ void tetgenmesh::numberedges()
       }
     }
     infect(worktet);
+    worktet.tet = tetrahedrontraverse();
+  }
+
+  // Infection is scratch state used while enumerating edges. Clear it before
+  // the later -C consistency check interprets it as a topology error.
+  tetrahedrons->traversalinit();
+  worktet.tet = tetrahedrontraverse();
+  while (worktet.tet != NULL) {
+    uninfect(worktet);
     worktet.tet = tetrahedrontraverse();
   }
 }
@@ -39233,6 +39771,7 @@ void tetgenmesh::out_nodes_Steiner_tags() // all Steiner points with Tags
 void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
                     tetgenio *addin, tetgenio *bgmin)
 {
+  tetgen_read_r2_controls(b);
   tetgenmesh m;
   clock_t tv[15], ts[6]; // Timing informations (defined in time.h)
   REAL cps = (REAL) CLOCKS_PER_SEC;
@@ -39431,7 +39970,11 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
     fflush(stderr);
   }
 
-  if ((b->metric || b->coarsen) &&  !b->nocoarsen) { // -m or -R and not -K
+  // R2 is a terminal, quality-transactional coarsening pass.  Run the legacy
+  // metric/R1 modes here, but defer R2 until smoothing and improve_mesh() have
+  // completed so later non-transactional flips cannot invalidate its gate.
+  if ((b->metric || (b->coarsen && (b->coarsen_param != 2))) &&
+      !b->nocoarsen) { // -m or legacy -R and not -K
     m.meshcoarsening();
   }
 
@@ -39568,6 +40111,10 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
 
   if (b->plc || b->quality || (b->metric || b->coarsen)) {
     m.improve_mesh();
+  }
+
+  if (b->coarsen && (b->coarsen_param == 2) && !b->nocoarsen) {
+    m.meshcoarsening();
   }
 
   tv[11] = clock();

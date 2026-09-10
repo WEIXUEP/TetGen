@@ -723,6 +723,10 @@ public:
   REAL metric_scale;                                              // -m#, 1.0.
   REAL smooth_alpha;                                             // '-s', 0.3.
   REAL coarsen_percent;                                         // -R1/#, 1.0.
+  long coarsen_eligible_count;                                  // R2 eligible interior points.
+  // R2 quality candidate controls (set by the adapter/environment).
+  REAL coarsen_candidate_percent;
+  REAL coarsen_quality_threshold;
   REAL elem_growth_ratio;             // Growth ratio of # elements, -r#, 0.0.
   REAL refine_progress_ratio;                                  // -r/#, 0.333.
 
@@ -852,6 +856,9 @@ public:
     optmaxdihedral = 177.00;
     epsilon = 1.0e-8;
     coarsen_percent = 1.0;
+    coarsen_eligible_count = 0;
+    coarsen_candidate_percent = 0.05;
+    coarsen_quality_threshold = 0.1;
     metric_scale = 1.0; // -m#
     elem_growth_ratio = 0.0; // -r#
     refine_progress_ratio = 0.333; // -r/#
@@ -1292,6 +1299,11 @@ public:
     REAL cosdihed_out; // The improved cosine of the dihedral angle.
     REAL max_asp_out; // Max asp ratio after the improvement of dihedral angle.
 
+    // R2 surface coarsening: lower bound for persistent replacement tets.
+    int coarsen_quality_gate;
+    REAL coarsen_quality_floor;
+    REAL coarsen_surface_quality_floor;
+
     // Boundary recovery flags.
     int checkflipeligibility;
     point seg[2];  // A constraining edge to be recovered.
@@ -1315,6 +1327,9 @@ public:
       cosdihed_in = 0.0;
       cosdihed_out = 0.0;
       max_asp_out = 0.0;
+      coarsen_quality_gate = 0;
+      coarsen_quality_floor = 0.0;
+      coarsen_surface_quality_floor = 0.0;
 
       checkflipeligibility = 0;
       seg[0] = NULL;
@@ -2124,6 +2139,7 @@ public:
   int getedge(point, point, triface*);
   int reduceedgesatvertex(point startpt, arraypool* endptlist, flipconstraints &fc);
   int removevertexbyflips(point steinerpt, flipconstraints &fc);
+  bool removefacetvertexbyquality(point rempt);
 
   int smoothpoint(point smtpt, arraypool*, int ccw, optparameters *opm);
   int suppressbdrysteinerpoint(point steinerpt);
@@ -2265,7 +2281,10 @@ public:
   bool add_steinerpt_to_remove_edge(triface *sliver_tet, triface *short_edge, REAL in_asp, REAL in_cosmaxd);
   bool smooth_flat_S_tet(triface *sliver_edge, REAL in_asp, REAL in_cosmaxd);
   bool is_edge_collapsible(triface *check_edge, REAL* lambda);
-  bool collapse_edge_to_improve(triface *short_edge, REAL in_asp, REAL in_cosmaxd);
+  bool collapse_edge_to_improve(triface *short_edge, REAL in_asp,
+                                REAL in_cosmaxd,
+                                int allow_input_volume_vertex = 0);
+  bool collapsevertexbyquality(point rempt);
   bool flip_edge_to_improve(triface *sliver_edge, REAL in_cosmaxd);
   bool flip_face_to_improve(triface *flip_face, REAL in_cosmaxd);
   void get_flat_T_tet_shape(badface *bf, REAL, REAL, triface*, triface*, triface*);
