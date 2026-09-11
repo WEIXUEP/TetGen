@@ -26,6 +26,16 @@ add_executable(tetgen tetgen.cxx predicates.cxx)
 # In Linux/Unix, it will create libtet.a
 add_library(tet STATIC tetgen.cxx predicates.cxx)
 
+# Persistent binary worker used by Omega_h's out-of-process adapter.  It
+# wraps the public library API and deliberately leaves TetGen's CLI and
+# meshing implementation unchanged.
+add_executable(tetgen_worker omega_h_worker.cxx)
+target_link_libraries(tetgen_worker PRIVATE tet)
+target_include_directories(tetgen_worker PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}")
+set_target_properties(tetgen_worker PROPERTIES
+  CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+
 # Alias so this build (e.g. via add_subdirectory) can be consumed under the
 # same namespaced name TetGen::TetGen as when installed and found with
 # find_package(TetGen).
@@ -58,7 +68,7 @@ set_target_properties(tet PROPERTIES
 
 # Installs the tetgen executable into the standard binary directory
 # (e.g. /usr/local/bin) on `make install`.
-install(TARGETS tetgen RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS tetgen tetgen_worker RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 # Installs the public header so downstream projects linking against the
 # library can #include <tetgen.h>.
