@@ -23018,8 +23018,8 @@ int tetgenmesh::removevertexbyflips(point steinerpt, flipconstraints &fc)
 //                                                                            //
 // removefacetvertexbyquality()  Quality-gated native surface point removal. //
 //                                                                            //
-// The topology operation remains TetGen's removevertexbyflips(). R2 only     //
-// supplies a strict lower bound derived from the original vertex star.       //
+// The topology operation remains TetGen's removevertexbyflips(). R2 supplies //
+// quality floors and validates the resulting local PLC after deletion.       //
 //                                                                            //
 //============================================================================//
 
@@ -23028,6 +23028,249 @@ bool tetgenmesh::removefacetvertexbyquality(point rempt)
   verttype original_type = pointtype(rempt);
   if ((original_type != FACETVERTEX) &&
       (original_type != FREEFACETVERTEX)) return false;
+
+  // Save the old surface one-ring, but do not use it to veto the deletion.
+  // The native operation is always tried first.  Only after it succeeds do
+  // we compare the replacement with this immutable local PLC certificate.
+  // TetGen knows shell markers and material attributes here; CAD/Physical
+  // recovery remains the adapter's job.
+  struct plcedge {
+    point a;
+    point b;
+  };
+  struct plcvertex {
+    point vertex;
+    REAL coordinates[3];
+  };
+  struct plcpatchcertificate {
+    std::vector<plcvertex> boundary;
+    std::vector<plcedge> boundary_edges;
+    point plane[3];
+    REAL regions[2];
+    REAL old_area;
+    REAL scale;
+    int region_present[2];
+    int marker;
+  } plc;
+  plc.old_area = 0.0;
+  plc.scale = 0.0;
+  plc.region_present[0] = plc.region_present[1] = 0;
+  plc.regions[0] = plc.regions[1] = 0.0;
+  plc.marker = 0;
+  plc.plane[0] = plc.plane[1] = plc.plane[2] = NULL;
+  const char* plc_rejection = NULL;
+  bool plc_certificate_ready = false;
+
+  auto triangle_area = [](point pa, point pb, point pc) -> REAL {
+    REAL ab[3], ac[3], cross[3];
+    for (int axis = 0; axis < 3; ++axis) {
+      ab[axis] = pb[axis] - pa[axis];
+      ac[axis] = pc[axis] - pa[axis];
+    }
+    cross[0] = ab[1] * ac[2] - ab[2] * ac[1];
+    cross[1] = ab[2] * ac[0] - ab[0] * ac[2];
+    cross[2] = ab[0] * ac[1] - ab[1] * ac[0];
+    return 0.5 * sqrt(cross[0] * cross[0] + cross[1] * cross[1] +
+                      cross[2] * cross[2]);
+  };
+  auto same_edge = [](point a0, point a1, point b0, point b1) -> bool {
+    return (a0 == b0 && a1 == b1) || (a0 == b1 && a1 == b0);
+  };
+  auto subface_regions = [&](face surface, int present[2], REAL regions[2]) {
+    triface side[2];
+    side[0].tet = side[1].tet = NULL;
+    stpivot(surface, side[0]);
+    sesymself(surface);
+    stpivot(surface, side[1]);
+    for (int i = 0; i < 2; ++i) {
+      present[i] = side[i].tet != NULL && !ishulltet(side[i]);
+      regions[i] = present[i] && numelemattrib > 0 ?
+          elemattribute(side[i].tet, numelemattrib - 1) : 0.0;
+    }
+    if ((present[0] > present[1]) ||
+        ((present[0] == present[1]) && (regions[0] > regions[1]))) {
+      std::swap(present[0], present[1]);
+      std::swap(regions[0], regions[1]);
+    }
+  };
+  auto same_regions = [](int const lhs_present[2], REAL const lhs[2],
+                         int const rhs_present[2], REAL const rhs[2]) -> bool {
+    for (int i = 0; i < 2; ++i) {
+      if (lhs_present[i] != rhs_present[i]) return false;
+      if (lhs_present[i] && lhs[i] != rhs[i]) return false;
+    }
+    return true;
+  };
+
+  std::vector<face> old_surface;
+  subfaces->traversalinit();
+  face surface;
+  surface.shver = 0;
+  surface.sh = shellfacetraverse(subfaces);
+  while (surface.sh != NULL) {
+    surface.shver = 0;
+    point vertices[3] = {sorg(surface), sdest(surface), sapex(surface)};
+    int removed_corners = 0;
+    for (int i = 0; i < 3; ++i) removed_corners += vertices[i] == rempt;
+    if (removed_corners == 1) {
+      old_surface.push_back(surface);
+    }
+    surface.sh = shellfacetraverse(subfaces);
+  }
+
+  if (old_surface.size() < 3) {
+    plc_rejection = "plc_surface_star_too_small";
+  } else {
+    plc.marker = shellmark(old_surface[0]);
+    plc.old_area = 0.0;
+    plc.scale = 0.0;
+    int reference_present[2];
+    REAL reference_regions[2];
+    subface_regions(old_surface[0], reference_present, reference_regions);
+    for (int i = 0; i < 2; ++i) {
+      plc.region_present[i] = reference_present[i];
+      plc.regions[i] = reference_regions[i];
+    }
+    for (size_t i = 0; i < old_surface.size(); ++i) {
+      point pa = sorg(old_surface[i]);
+      point pb = sdest(old_surface[i]);
+      point pc = sapex(old_surface[i]);
+      point vertices[3] = {pa, pb, pc};
+      point edge_vertices[2] = {NULL, NULL};
+      int edge_vertex_count = 0;
+      for (int corner = 0; corner < 3; ++corner) {
+        if (vertices[corner] == rempt) continue;
+        if (edge_vertex_count < 2)
+          edge_vertices[edge_vertex_count++] = vertices[corner];
+      }
+      if (edge_vertex_count != 2 || edge_vertices[0] == edge_vertices[1] ||
+          edge_vertices[0] == NULL || edge_vertices[1] == NULL) {
+        plc_rejection = "plc_surface_boundary_incidence_invalid";
+        break;
+      }
+      for (int endpoint = 0; endpoint < 2; ++endpoint) {
+        bool found = false;
+        for (size_t j = 0; j < plc.boundary.size(); ++j) {
+          if (plc.boundary[j].vertex == edge_vertices[endpoint]) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          plcvertex saved;
+          saved.vertex = edge_vertices[endpoint];
+          for (int axis = 0; axis < 3; ++axis)
+            saved.coordinates[axis] = edge_vertices[endpoint][axis];
+          plc.boundary.push_back(saved);
+        }
+      }
+      for (size_t j = 0; j < plc.boundary_edges.size(); ++j) {
+        if (same_edge(plc.boundary_edges[j].a, plc.boundary_edges[j].b,
+                      edge_vertices[0], edge_vertices[1])) {
+          plc_rejection = "plc_surface_boundary_edge_repeated";
+          break;
+        }
+      }
+      if (plc_rejection != NULL) break;
+      plcedge edge = {edge_vertices[0], edge_vertices[1]};
+      plc.boundary_edges.push_back(edge);
+      int present[2];
+      REAL regions[2];
+      subface_regions(old_surface[i], present, regions);
+      REAL area = triangle_area(pa, pb, pc);
+      if (shellmark(old_surface[i]) != plc.marker) {
+        plc_rejection = "plc_surface_marker_mixed";
+        break;
+      }
+      if (!same_regions(plc.region_present, plc.regions, present, regions)) {
+        plc_rejection = "plc_surface_region_pair_mixed";
+        break;
+      }
+      if (!(area > 0.0) || !isfinite(area)) {
+        plc_rejection = "plc_surface_degenerate_triangle";
+        break;
+      }
+      plc.old_area += area;
+    }
+    if (plc_rejection == NULL &&
+        (plc.boundary.size() != old_surface.size() ||
+         plc.boundary_edges.size() != old_surface.size())) {
+      plc_rejection = "plc_surface_boundary_incidence_invalid";
+    }
+    for (size_t i = 0; plc_rejection == NULL && i < plc.boundary.size(); ++i) {
+      int degree = 0;
+      int radial_incidence = 0;
+      for (size_t j = 0; j < plc.boundary_edges.size(); ++j) {
+        if (plc.boundary_edges[j].a == plc.boundary[i].vertex ||
+            plc.boundary_edges[j].b == plc.boundary[i].vertex) degree++;
+      }
+      for (size_t j = 0; j < old_surface.size(); ++j) {
+        point vertices[3] = {sorg(old_surface[j]), sdest(old_surface[j]),
+                             sapex(old_surface[j])};
+        for (int corner = 0; corner < 3; ++corner)
+          if (vertices[corner] == plc.boundary[i].vertex) radial_incidence++;
+      }
+      if (degree != 2 || radial_incidence != 2)
+        plc_rejection = "plc_surface_boundary_not_single_cycle";
+    }
+    if (plc_rejection == NULL) {
+      std::vector<bool> visited(plc.boundary_edges.size(), false);
+      point start = plc.boundary_edges[0].a;
+      point current = start;
+      for (size_t step = 0; step < plc.boundary_edges.size(); ++step) {
+        int next_edge = -1;
+        for (size_t edge = 0; edge < plc.boundary_edges.size(); ++edge) {
+          if (!visited[edge] &&
+              (plc.boundary_edges[edge].a == current ||
+               plc.boundary_edges[edge].b == current)) {
+            next_edge = (int) edge;
+            break;
+          }
+        }
+        if (next_edge < 0) {
+          plc_rejection = "plc_surface_boundary_not_single_cycle";
+          break;
+        }
+        visited[next_edge] = true;
+        current = plc.boundary_edges[next_edge].a == current ?
+            plc.boundary_edges[next_edge].b : plc.boundary_edges[next_edge].a;
+      }
+      if (plc_rejection == NULL && current != start)
+        plc_rejection = "plc_surface_boundary_not_single_cycle";
+    }
+    if (plc_rejection == NULL) {
+      plc.plane[0] = rempt;
+      plc.plane[1] = plc.boundary_edges[0].a;
+      plc.plane[2] = plc.boundary_edges[0].b;
+      for (size_t i = 0; i < plc.boundary.size(); ++i) {
+        plc.scale = std::max(plc.scale,
+            distance(rempt, plc.boundary[i].vertex));
+        for (size_t j = i + 1; j < plc.boundary.size(); ++j)
+          plc.scale = std::max(plc.scale, distance(
+              plc.boundary[i].vertex, plc.boundary[j].vertex));
+      }
+      REAL plane_tolerance = 64.0 * b->epsilon *
+          plc.scale * plc.scale * plc.scale;
+      if (!(plc.scale > 0.0) || !(plc.old_area > 0.0) ||
+          !isfinite(plc.old_area)) {
+        plc_rejection = "plc_surface_degenerate_patch";
+      }
+      for (size_t i = 0; plc_rejection == NULL &&
+           i < plc.boundary.size(); ++i) {
+        if (fabs(orient3d(plc.plane[0], plc.plane[1], plc.plane[2],
+                          plc.boundary[i].vertex)) > plane_tolerance)
+          plc_rejection = "plc_surface_nonplanar";
+      }
+    }
+    plc_certificate_ready = plc_rejection == NULL;
+  }
+  if (getenv("TETGEN_DEBUG_R2_CANDIDATES") != NULL &&
+      plc_rejection != NULL) {
+    fprintf(stderr,
+        "[tetgen-r2-plc] mark=%d precheck_ready=0 "
+        "deletion_still_attempted=1 reason=%s\n",
+        pointmark(rempt), plc_rejection);
+  }
 
   REAL quality_before = 1.0;
   REAL surface_quality_before = 1.0;
@@ -23087,6 +23330,241 @@ bool tetgenmesh::removefacetvertexbyquality(point rempt)
       st_facref_count++;
     } else {
       setpointtype(rempt, FACETVERTEX);
+    }
+  }
+  if (removed) {
+    const char* post_rejection = plc_certificate_ready ? NULL : plc_rejection;
+    std::vector<face> candidates;
+    subfaces->traversalinit();
+    surface.shver = 0;
+    surface.sh = shellfacetraverse(subfaces);
+    while (surface.sh != NULL) {
+      surface.shver = 0;
+      point vertices[3] = {sorg(surface), sdest(surface), sapex(surface)};
+      bool vertices_in_boundary = true;
+      for (int corner = 0; corner < 3; ++corner) {
+        bool found = false;
+        for (size_t i = 0; i < plc.boundary.size(); ++i) {
+          if (vertices[corner] == plc.boundary[i].vertex) {
+            found = true;
+            break;
+          }
+        }
+        vertices_in_boundary = vertices_in_boundary && found;
+      }
+      int present[2] = {0, 0};
+      REAL regions[2] = {0.0, 0.0};
+      if (plc_certificate_ready && vertices_in_boundary)
+        subface_regions(surface, present, regions);
+      if (plc_certificate_ready && vertices_in_boundary &&
+          shellmark(surface) == plc.marker &&
+          same_regions(plc.region_present, plc.regions, present, regions)) {
+        candidates.push_back(surface);
+      }
+      surface.sh = shellfacetraverse(subfaces);
+    }
+
+    for (size_t i = 0; post_rejection == NULL &&
+         i < plc.boundary.size(); ++i) {
+      for (int axis = 0; axis < 3; ++axis) {
+        if (plc.boundary[i].vertex[axis] !=
+            plc.boundary[i].coordinates[axis]) {
+          post_rejection = "plc_surface_boundary_coordinate_changed";
+          break;
+        }
+      }
+    }
+
+    // The boundary edge's old face tells us which side belongs to this
+    // patch.  Seed the replacement there, then traverse only across
+    // non-boundary edges.  This excludes the untouched surface outside the
+    // saved one-ring even when it has the same marker and material pair.
+    int seed = -1;
+    if (post_rejection == NULL) {
+      point edge_a = plc.boundary_edges[0].a;
+      point edge_b = plc.boundary_edges[0].b;
+      REAL edge_vector[3], old_vector[3], reference_normal[3];
+      for (int axis = 0; axis < 3; ++axis) {
+        edge_vector[axis] = edge_b[axis] - edge_a[axis];
+        old_vector[axis] = rempt[axis] - edge_a[axis];
+      }
+      reference_normal[0] = edge_vector[1] * old_vector[2] -
+          edge_vector[2] * old_vector[1];
+      reference_normal[1] = edge_vector[2] * old_vector[0] -
+          edge_vector[0] * old_vector[2];
+      reference_normal[2] = edge_vector[0] * old_vector[1] -
+          edge_vector[1] * old_vector[0];
+      int seed_count = 0;
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        point vertices[3] = {sorg(candidates[i]), sdest(candidates[i]),
+                             sapex(candidates[i])};
+        bool has_a = false, has_b = false;
+        point third = NULL;
+        for (int corner = 0; corner < 3; ++corner) {
+          has_a = has_a || vertices[corner] == edge_a;
+          has_b = has_b || vertices[corner] == edge_b;
+          if (vertices[corner] != edge_a && vertices[corner] != edge_b)
+            third = vertices[corner];
+        }
+        if (!has_a || !has_b || third == NULL) continue;
+        REAL candidate_vector[3], candidate_normal[3];
+        for (int axis = 0; axis < 3; ++axis)
+          candidate_vector[axis] = third[axis] - edge_a[axis];
+        candidate_normal[0] = edge_vector[1] * candidate_vector[2] -
+            edge_vector[2] * candidate_vector[1];
+        candidate_normal[1] = edge_vector[2] * candidate_vector[0] -
+            edge_vector[0] * candidate_vector[2];
+        candidate_normal[2] = edge_vector[0] * candidate_vector[1] -
+            edge_vector[1] * candidate_vector[0];
+        REAL side = 0.0;
+        for (int axis = 0; axis < 3; ++axis)
+          side += reference_normal[axis] * candidate_normal[axis];
+        if (side > 0.0) {
+          seed = (int) i;
+          seed_count++;
+        }
+      }
+      if (seed_count != 1)
+        post_rejection = "plc_surface_replacement_seed_not_unique";
+    }
+
+    std::vector<bool> selected(candidates.size(), false);
+    std::vector<int> work;
+    if (post_rejection == NULL) {
+      selected[seed] = true;
+      work.push_back(seed);
+    }
+    for (size_t cursor = 0; post_rejection == NULL &&
+         cursor < work.size(); ++cursor) {
+      face current = candidates[work[cursor]];
+      point vertices[3] = {sorg(current), sdest(current), sapex(current)};
+      for (int edge = 0; edge < 3; ++edge) {
+        point edge_a = vertices[edge];
+        point edge_b = vertices[(edge + 1) % 3];
+        bool is_boundary = false;
+        for (size_t i = 0; i < plc.boundary_edges.size(); ++i) {
+          if (same_edge(edge_a, edge_b, plc.boundary_edges[i].a,
+                        plc.boundary_edges[i].b)) {
+            is_boundary = true;
+            break;
+          }
+        }
+        if (is_boundary) continue;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+          point other[3] = {sorg(candidates[i]), sdest(candidates[i]),
+                            sapex(candidates[i])};
+          bool has_a = false, has_b = false;
+          for (int corner = 0; corner < 3; ++corner) {
+            has_a = has_a || other[corner] == edge_a;
+            has_b = has_b || other[corner] == edge_b;
+          }
+          if (has_a && has_b && !selected[i]) {
+            selected[i] = true;
+            work.push_back((int) i);
+          }
+        }
+      }
+    }
+
+    std::vector<plcedge> replacement_edges;
+    std::vector<int> replacement_edge_incidence;
+    REAL replacement_area = 0.0;
+    size_t replacement_count = 0;
+    REAL plane_tolerance = 64.0 * b->epsilon *
+        plc.scale * plc.scale * plc.scale;
+    for (size_t i = 0; post_rejection == NULL &&
+         i < candidates.size(); ++i) {
+      if (!selected[i]) continue;
+      replacement_count++;
+      point vertices[3] = {sorg(candidates[i]), sdest(candidates[i]),
+                           sapex(candidates[i])};
+      REAL area = triangle_area(vertices[0], vertices[1], vertices[2]);
+      if (!(area > 0.0) || !isfinite(area)) {
+        post_rejection = "plc_surface_replacement_degenerate";
+        break;
+      }
+      replacement_area += area;
+      for (int corner = 0; corner < 3; ++corner) {
+        if (fabs(orient3d(plc.plane[0], plc.plane[1], plc.plane[2],
+                          vertices[corner])) > plane_tolerance) {
+          post_rejection = "plc_surface_replacement_nonplanar";
+          break;
+        }
+      }
+      for (int edge = 0; post_rejection == NULL && edge < 3; ++edge) {
+        point edge_a = vertices[edge];
+        point edge_b = vertices[(edge + 1) % 3];
+        int found = -1;
+        for (size_t j = 0; j < replacement_edges.size(); ++j) {
+          if (same_edge(edge_a, edge_b, replacement_edges[j].a,
+                        replacement_edges[j].b)) {
+            found = (int) j;
+            break;
+          }
+        }
+        if (found < 0) {
+          plcedge saved = {edge_a, edge_b};
+          replacement_edges.push_back(saved);
+          replacement_edge_incidence.push_back(1);
+        } else {
+          replacement_edge_incidence[found]++;
+        }
+      }
+    }
+
+    if (post_rejection == NULL &&
+        replacement_count + 2 != plc.boundary.size())
+      post_rejection = "plc_surface_replacement_not_disk";
+    for (size_t i = 0; post_rejection == NULL &&
+         i < replacement_edges.size(); ++i) {
+      bool is_boundary = false;
+      for (size_t j = 0; j < plc.boundary_edges.size(); ++j) {
+        if (same_edge(replacement_edges[i].a, replacement_edges[i].b,
+                      plc.boundary_edges[j].a,
+                      plc.boundary_edges[j].b)) {
+          is_boundary = true;
+          break;
+        }
+      }
+      int expected = is_boundary ? 1 : 2;
+      if (replacement_edge_incidence[i] != expected)
+        post_rejection = "plc_surface_replacement_edge_incidence_changed";
+    }
+    for (size_t i = 0; post_rejection == NULL &&
+         i < plc.boundary_edges.size(); ++i) {
+      int incidence = 0;
+      for (size_t j = 0; j < replacement_edges.size(); ++j) {
+        if (same_edge(plc.boundary_edges[i].a, plc.boundary_edges[i].b,
+                      replacement_edges[j].a, replacement_edges[j].b))
+          incidence = replacement_edge_incidence[j];
+      }
+      if (incidence != 1)
+        post_rejection = "plc_surface_boundary_changed";
+    }
+    REAL area_tolerance = 256.0 * b->epsilon *
+        std::max(plc.scale * plc.scale, plc.old_area);
+    if (post_rejection == NULL &&
+        fabs(replacement_area - plc.old_area) > area_tolerance)
+      post_rejection = "plc_surface_coverage_changed";
+    if (post_rejection != NULL) {
+      // The public flip helpers release their local undo records on success.
+      // Mark this trial for a restart from the immutable input instead of
+      // exposing or attempting to patch a changed PLC in place.
+      b->r2_plc_retry_pointmark = pointmark(rempt);
+      if (getenv("TETGEN_DEBUG_R2_CANDIDATES") != NULL) {
+        fprintf(stderr,
+            "[tetgen-r2-plc] mark=%d accepted=0 restart=1 reason=%s\n",
+            pointmark(rempt), post_rejection);
+      }
+      return false;
+    }
+    if (getenv("TETGEN_DEBUG_R2_CANDIDATES") != NULL) {
+      fprintf(stderr,
+          "[tetgen-r2-plc] mark=%d accepted=1 old_area=%.17g "
+          "new_area=%.17g old_triangles=%zu new_triangles=%zu marker=%d\n",
+          pointmark(rempt), (double) plc.old_area,
+          (double) replacement_area, old_surface.size(), replacement_count,
+          plc.marker);
     }
   }
   return removed;
@@ -26021,8 +26499,10 @@ int tetgenmesh::scout_point(point searchpt, triface *searchtet, int randflag)
   int maxiter = 100, iter = 0;
 
   do {
-    // 'searchtet' must be a valid tetrahedron.
-    if (searchtet->tet == NULL) {
+    // Insertion can delete the tetrahedron retained from the previous point.
+    // Re-sample instead of walking from a non-null dead tetrahedron.
+    if (isdeadtet(*searchtet)) {
+      searchtet->tet = NULL;
       // Randomly select a good starting tet.
       if (debug_locate) { fprintf(stderr, "[tetgen-scout] before-randomsample\n"); fflush(stderr); }
       randomsample(searchpt, searchtet);
@@ -26054,7 +26534,7 @@ int tetgenmesh::scout_point(point searchpt, triface *searchtet, int randflag)
     }
   
     if (ishulltet(*searchtet)) {
-      if ((recenttet.tet != NULL) && !ishulltet(recenttet)) {
+      if (!isdeadtet(recenttet) && !ishulltet(recenttet)) {
         *searchtet = recenttet;
       }
     }
@@ -26413,6 +26893,21 @@ void tetgenmesh::insertconstrainedpoints(point *insertarray, int arylen,
   encseglist = new arraypool(sizeof(face), 8);
   encshlist = new arraypool(sizeof(badface), 8);
   searchtet.tet = NULL;
+  bool deferred_declared_edge_flips = false;
+
+  // Edge-support attributes contain input point numbers resolved by the
+  // caller. Build the point lookup once; ordinary add-in points do not use it.
+  std::vector<point> inputpoints(in->numberofpoints, (point) NULL);
+  if (numpointattrib >= 3) {
+    points->traversalinit();
+    point inputpoint = pointtraverse();
+    while (inputpoint != NULL) {
+      int mark = pointmark(inputpoint) - in->firstnumber;
+      if (mark >= 0 && mark < in->numberofpoints)
+        inputpoints[mark] = inputpoint;
+      inputpoint = pointtraverse();
+    }
+  }
 
   if (debug_insert) {
     fprintf(stderr, "[tetgen-addin] array-state-ready count=%d searchtet=NULL\n", arylen);
@@ -26421,14 +26916,120 @@ void tetgenmesh::insertconstrainedpoints(point *insertarray, int arylen,
 
   // Insert the points.
   for (i = 0; i < arylen; i++) {
+    // Ordinary points retain TetGen's original Bowyer-Watson insertion.
+    // Declared edge points override this below so every support edge in the
+    // batch is split before any Delaunay flip can remove another support.
+    ivf.bowywat = 1;
+    ivf.lawson = 2;
     if (debug_insert) {
       fprintf(stderr, "[tetgen-addin] before-scout index=%d mark=%d\n",
           i, pointmark(insertarray[i]));
       fflush(stderr);
     }
-    // Find the location of the inserted point.
-    // Do not use 'recenttet', since the mesh may be non-convex.
-    ivf.iloc = scout_point(insertarray[i], &searchtet, randflag);
+    bool located_on_declared_edge = false;
+    if (numpointattrib >= 3) {
+      REAL raw_a = insertarray[i][4];
+      REAL raw_b = insertarray[i][5];
+      bool finite_support = isfinite(raw_a) && isfinite(raw_b);
+      int endpoint_a = finite_support ? (int) llround(raw_a) : -1;
+      int endpoint_b = finite_support ? (int) llround(raw_b) : -1;
+      bool has_support = !finite_support ||
+          endpoint_a >= 0 || endpoint_b >= 0;
+      if (has_support) {
+        bool valid_support = finite_support &&
+            raw_a == (REAL) endpoint_a && raw_b == (REAL) endpoint_b &&
+            endpoint_a >= 0 && endpoint_a < in->numberofpoints &&
+            endpoint_b >= 0 && endpoint_b < in->numberofpoints &&
+            endpoint_a != endpoint_b && inputpoints[endpoint_a] != NULL &&
+            inputpoints[endpoint_b] != NULL;
+        triface declared_edge;
+        declared_edge.tet = NULL;
+        if (valid_support) {
+          point edge_a = inputpoints[endpoint_a];
+          point edge_b = inputpoints[endpoint_b];
+          valid_support = getedge(edge_a, edge_b, &declared_edge) != 0;
+          if (!valid_support) {
+            // Repeated ONEDGE fan splits can leave an old endpoint's
+            // point-to-tetrahedron hint stale even though the exact edge is
+            // still present. getedge() starts from that hint and may then
+            // report a false negative. Recover by inspecting live
+            // tetrahedra using endpoint identity, never coordinates.
+            tetrahedrons->traversalinit();
+            tetrahedron *candidate_tet = tetrahedrontraverse();
+            while (candidate_tet != NULL && !valid_support) {
+              triface candidate;
+              candidate.tet = candidate_tet;
+              candidate.ver = 0;
+              if (!isdeadtet(candidate)) {
+                for (int ver = 0; ver < 12; ++ver) {
+                  candidate.ver = ver;
+                  if (org(candidate) == edge_a && dest(candidate) == edge_b) {
+                    declared_edge = candidate;
+                    valid_support = true;
+                    break;
+                  }
+                }
+              }
+              candidate_tet = tetrahedrontraverse();
+            }
+            if (debug_insert) {
+              fprintf(stderr,
+                  "[tetgen-addin] declared-edge-index-fallback index=%d mark=%d support=%d:%d found=%d\n",
+                  i, pointmark(insertarray[i]), endpoint_a, endpoint_b,
+                  valid_support ? 1 : 0);
+              fflush(stderr);
+            }
+          }
+        }
+        if (valid_support) {
+          point edge_a = inputpoints[endpoint_a];
+          point edge_b = inputpoints[endpoint_b];
+          REAL length_squared = 0.0, dot = 0.0, scale = 1.0;
+          for (int axis = 0; axis < 3; ++axis) {
+            REAL direction = edge_b[axis] - edge_a[axis];
+            REAL relative = insertarray[i][axis] - edge_a[axis];
+            length_squared += direction * direction;
+            dot += relative * direction;
+            scale = std::max(scale, std::max(fabs(edge_a[axis]),
+                std::max(fabs(edge_b[axis]), fabs(insertarray[i][axis]))));
+          }
+          REAL parameter = length_squared > 0.0 ? dot / length_squared : 0.0;
+          REAL tolerance = 512.0 * DBL_EPSILON * scale;
+          REAL parameter_tolerance = length_squared > 0.0 ?
+              tolerance / sqrt(length_squared) : 1.0;
+          REAL residual_squared = 0.0;
+          for (int axis = 0; axis < 3; ++axis) {
+            REAL residual = insertarray[i][axis] - edge_a[axis] -
+                parameter * (edge_b[axis] - edge_a[axis]);
+            residual_squared += residual * residual;
+          }
+          valid_support = length_squared > 0.0 &&
+              residual_squared <= tolerance * tolerance &&
+              parameter > parameter_tolerance &&
+              parameter < 1.0 - parameter_tolerance;
+        }
+        if (!valid_support) {
+          if (debug_insert) {
+            fprintf(stderr,
+                "[tetgen-addin] declared-edge-rejected index=%d mark=%d support=%d:%d\n",
+                i, pointmark(insertarray[i]), endpoint_a, endpoint_b);
+            fflush(stderr);
+          }
+          setpointtype(insertarray[i], UNUSEDVERTEX);
+          unuverts++;
+          continue;
+        }
+        searchtet = declared_edge;
+        ivf.iloc = (int) ONEDGE;
+        ivf.bowywat = 0;
+        located_on_declared_edge = true;
+      }
+    }
+    if (!located_on_declared_edge) {
+      // Ordinary points retain TetGen's coordinate-based point locator.
+      // Do not use 'recenttet', since the mesh may be non-convex.
+      ivf.iloc = scout_point(insertarray[i], &searchtet, randflag);
+    }
     if (debug_insert) {
       fprintf(stderr, "[tetgen-addin] after-scout index=%d loc=%d tet=%p\n",
           i, ivf.iloc, (void *)searchtet.tet);
@@ -26476,14 +27077,20 @@ void tetgenmesh::insertconstrainedpoints(point *insertarray, int arylen,
     }
 
     // Now insert the point.  ONEDGE points use TetGen's native conforming
-    // edge split and subsequent Delaunay recovery.
+    // edge fan split. Delaunay flips for declared edges are deferred until
+    // every edge in this add-in batch has been split, otherwise an early flip
+    // can remove the exact support edge of a later request.
     if (insertpoint(insertarray[i], &searchtet, &splitsh, &splitseg, &ivf)) {
       if (flipstack != NULL) {
-        flipconstraints fc;
-        //fc.chkencflag = chkencflag;
-        fc.enqflag = 2;
-        lawsonflip3d(&fc);
-        //unflipqueue->restart();
+        if (located_on_declared_edge) {
+          deferred_declared_edge_flips = true;
+        } else {
+          flipconstraints fc;
+          //fc.chkencflag = chkencflag;
+          fc.enqflag = 2;
+          lawsonflip3d(&fc);
+          //unflipqueue->restart();
+        }
       }
 
       if (later_unflip_queue->objects > b->unflip_queue_limit) {
@@ -26510,6 +27117,12 @@ void tetgenmesh::insertconstrainedpoints(point *insertarray, int arylen,
       encshlist->restart();
     }
   } // i
+
+  if (deferred_declared_edge_flips && flipstack != NULL) {
+    flipconstraints fc;
+    fc.enqflag = 2;
+    lawsonflip3d(&fc);
+  }
 
   if (later_unflip_queue->objects > 0) {
     flipconstraints fc;
@@ -26604,8 +27217,12 @@ void tetgenmesh::insertconstrainedpoints(tetgenio *addio)
     insertarray[arylen] = newpt;
     arylen++;
     if (debug_insert) {
-      fprintf(stderr, "[tetgen-addin] point-ready index=%d mark=%d xyz=%.17g,%.17g,%.17g\n",
+      fprintf(stderr, "[tetgen-addin] point-ready index=%d mark=%d xyz=%.17g,%.17g,%.17g",
           i, pointmark(newpt), x, y, z);
+      if (addio->numberofpointattributes >= 3) {
+        fprintf(stderr, " support=%.0f:%.0f", newpt[4], newpt[5]);
+      }
+      fprintf(stderr, "\n");
       fflush(stderr);
     }
   } // i
@@ -26952,6 +27569,19 @@ void tetgenmesh::meshcoarsening()
       point* parypt = (point*) fastlookup(remptlist, i);
       verttype candidate_type = pointtype(*parypt);
       if (candidate_type == UNUSEDVERTEX) continue;
+      if (((candidate_type == FACETVERTEX) ||
+           (candidate_type == FREEFACETVERTEX)) &&
+          std::find(b->r2_plc_rejected_pointmarks.begin(),
+                    b->r2_plc_rejected_pointmarks.end(),
+                    pointmark(*parypt)) !=
+              b->r2_plc_rejected_pointmarks.end()) {
+        if (getenv("TETGEN_DEBUG_R2_CANDIDATES") != NULL) {
+          fprintf(stderr,
+              "[tetgen-r2-plc] mark=%d skipped=1 reason=prior_plc_change\n",
+              pointmark(*parypt));
+        }
+        continue;
+      }
       attempts++;
       bool accepted = false;
       if ((candidate_type == VOLVERTEX) ||
@@ -26968,6 +27598,7 @@ void tetgenmesh::meshcoarsening()
             pointmark(*parypt), (int) candidate_type, accepted ? 1 : 0);
       }
       if (accepted) committed++;
+      if (b->r2_plc_retry_pointmark >= 0) break;
     }
     if (b->verbose) {
       printf("  R2 quality coarsening: candidates=%ld, attempts=%ld, "
@@ -30272,6 +30903,8 @@ enum tetgenmesh::locateresult
 tetgenmesh::locate_point_walk(point searchpt, triface* searchtet, int chkencflag)
 {
   const bool debug_locate = (getenv("TETGEN_DEBUG_INSERT") != NULL);
+  // The starting tetrahedron may have been removed by a preceding insertion.
+  if (isdeadtet(*searchtet)) return OUTSIDE;
   // Construct the starting point to be the barycenter of 'searchtet'.
   REAL startpt[3];
   point *ppt = (point *) &(searchtet->tet[4]);
@@ -30969,6 +31602,12 @@ void tetgenmesh::delaunayrefinement()
         printf("The desired number of Steiner points (%d) has reached.\n\n",
                b->steinerleft);
       }
+      // The configured limit includes Steiner-classified points already
+      // present in the reconstructed input.  No insertion budget remains for
+      // later improve_mesh() stages.  Leaving steinerleft at the baseline
+      // value here made those stages insert exactly that many extra points
+      // even when the application requested a zero new-point budget.
+      steinerleft = 0;
       return; // No more Steiner points.
     }
   }
@@ -39990,8 +40629,19 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
     }
   }
 
-  if (b->plc || (b->refine && b->quality && (in->refine_elem_list == NULL))
-      || (b->metric || b->coarsen)) {
+  const bool needs_delaunay_recovery =
+    b->plc || (b->refine && b->quality && (in->refine_elem_list == NULL))
+      || (b->metric || b->coarsen);
+  // Omega_h edge batches carry the two exact support endpoints as add-in
+  // attributes. Recovering Delaunayness before consuming those points may
+  // legally flip away an ordinary support edge. Defer this global pass until
+  // every declared ONEDGE split has been materialized.
+  const bool defer_delaunay_recovery_for_declared_edges =
+    b->refine && b->insertaddpoints && addin != NULL &&
+    addin->numberofpoints > 0 && addin->numberofpointattributes >= 3;
+
+  if (needs_delaunay_recovery &&
+      !defer_delaunay_recovery_for_declared_edges) {
     if (!b->quiet) {
       printf("Recovering Delaunayness...\n");
     }
@@ -40032,6 +40682,23 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
         fprintf(stderr, "[tetgen-driver] constrained-insertion-returned\n");
         fflush(stderr);
       }
+    }
+  }
+
+  if (needs_delaunay_recovery &&
+      defer_delaunay_recovery_for_declared_edges) {
+    if (!b->quiet) {
+      printf("Recovering Delaunayness after declared edge insertion...\n");
+    }
+    if (debug_driver) {
+      fprintf(stderr, "[tetgen-driver] before-post-insertion-delaunay-recovery\n");
+      fflush(stderr);
+    }
+    tetgenmesh::flipconstraints fc;
+    m.recoverdelaunay(fc);
+    if (debug_driver) {
+      fprintf(stderr, "[tetgen-driver] post-insertion-delaunay-recovery-returned\n");
+      fflush(stderr);
     }
   }
 
@@ -40115,6 +40782,33 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
 
   if (b->coarsen && (b->coarsen_param == 2) && !b->nocoarsen) {
     m.meshcoarsening();
+    if (b->r2_plc_retry_pointmark >= 0) {
+      int const rejected_mark = b->r2_plc_retry_pointmark;
+      if (std::find(b->r2_plc_rejected_pointmarks.begin(),
+                    b->r2_plc_rejected_pointmarks.end(), rejected_mark) !=
+              b->r2_plc_rejected_pointmarks.end() ||
+          b->r2_plc_rejected_pointmarks.size() >=
+              static_cast<size_t>(in->numberofpoints)) {
+        fprintf(stderr,
+            "TetGen R2 PLC retry did not make progress at point %d.\n",
+            rejected_mark);
+        terminatetetgen(&m, 2);
+      }
+      b->r2_plc_rejected_pointmarks.push_back(rejected_mark);
+      b->r2_plc_retry_pointmark = -1;
+      if (getenv("TETGEN_DEBUG_R2_CANDIDATES") != NULL) {
+        fprintf(stderr,
+            "[tetgen-r2-plc] restarting_from_input rejected_mark=%d "
+            "rejected_count=%zu\n",
+            rejected_mark, b->r2_plc_rejected_pointmarks.size());
+      }
+      // No output has been materialized yet. Release the rejected trial and
+      // repeat from the immutable tetgenio input with this point excluded.
+      m.freememory();
+      m.initializetetgenmesh();
+      tetrahedralize(b, in, out, addin, bgmin);
+      return;
+    }
   }
 
   tv[11] = clock();

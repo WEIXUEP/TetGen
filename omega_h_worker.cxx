@@ -20,7 +20,7 @@
 namespace {
 
 constexpr std::uint32_t protocol_magic = 0x4f485447U;  // OHTG
-constexpr std::uint32_t protocol_version = 1;
+constexpr std::uint32_t protocol_version = 3;
 constexpr std::uint32_t command_execute = 1;
 constexpr std::uint32_t command_shutdown = 2;
 constexpr std::uint64_t maximum_items = std::uint64_t{1} << 31;
@@ -115,31 +115,39 @@ bool read_string(int fd, std::string* value) {
 
 bool read_mesh(int fd, tetgenio* mesh) {
   std::int32_t first = 0, points = 0, tets = 0, corners = 0;
-  std::int32_t attributes = 0, faces = 0, edges = 0;
-  std::uint8_t point_markers = 0, point_origins = 0;
-  std::uint8_t face_markers = 0, edge_markers = 0;
+  std::int32_t attributes = 0, faces = 0, edges = 0, plc_facets = 0;
+  std::int32_t regions = 0;
+  std::uint8_t point_markers = 0, point_origins = 0, edge_supports = 0;
+  std::uint8_t face_markers = 0, edge_markers = 0, plc_markers = 0;
   if (!read_scalar(fd, &first) || !read_scalar(fd, &points) ||
       !read_scalar(fd, &tets) || !read_scalar(fd, &corners) ||
       !read_scalar(fd, &attributes) || !read_scalar(fd, &faces) ||
-      !read_scalar(fd, &edges) || !read_scalar(fd, &point_markers) ||
+      !read_scalar(fd, &edges) || !read_scalar(fd, &plc_facets) ||
+      !read_scalar(fd, &regions) || !read_scalar(fd, &point_markers) ||
       !read_scalar(fd, &point_origins) || !read_scalar(fd, &face_markers) ||
-      !read_scalar(fd, &edge_markers))
+      !read_scalar(fd, &edge_markers) || !read_scalar(fd, &edge_supports) ||
+      !read_scalar(fd, &plc_markers))
     return false;
   if (points < 0 || tets < 0 || faces < 0 || edges < 0 || corners < 0 ||
-      attributes < 0)
+      attributes < 0 || plc_facets < 0 || regions < 0)
     return false;
   mesh->firstnumber = first;
   mesh->mesh_dim = 3;
   mesh->numberofpoints = points;
-  mesh->numberofpointattributes = point_origins ? 1 : 0;
   mesh->numberoftetrahedra = tets;
   mesh->numberofcorners = corners;
   mesh->numberoftetrahedronattributes = attributes;
   mesh->numberoftrifaces = faces;
   mesh->numberofedges = edges;
-  return read_array(fd, &mesh->pointlist, std::uint64_t(points) * 3) &&
+  REAL* point_origin_values = nullptr;
+  int* edge_support_values = nullptr;
+  int* plc_triangles = nullptr;
+  auto const arrays_ok = read_array(fd, &mesh->pointlist,
+          std::uint64_t(points) * 3) &&
       (!point_markers || read_array(fd, &mesh->pointmarkerlist, points)) &&
-      (!point_origins || read_array(fd, &mesh->pointattributelist, points)) &&
+      (!point_origins || read_array(fd, &point_origin_values, points)) &&
+      (!edge_supports || read_array(
+          fd, &edge_support_values, std::uint64_t(points) * 2)) &&
       read_array(fd, &mesh->tetrahedronlist,
           std::uint64_t(tets) * static_cast<unsigned>(corners)) &&
       read_array(fd, &mesh->tetrahedronattributelist,
@@ -147,14 +155,67 @@ bool read_mesh(int fd, tetgenio* mesh) {
       read_array(fd, &mesh->trifacelist, std::uint64_t(faces) * 3) &&
       (!face_markers || read_array(fd, &mesh->trifacemarkerlist, faces)) &&
       read_array(fd, &mesh->edgelist, std::uint64_t(edges) * 2) &&
-      (!edge_markers || read_array(fd, &mesh->edgemarkerlist, edges));
+      (!edge_markers || read_array(fd, &mesh->edgemarkerlist, edges)) &&
+      read_array(fd, &plc_triangles, std::uint64_t(plc_facets) * 3) &&
+      (!plc_markers || read_array(
+          fd, &mesh->facetmarkerlist, plc_facets)) &&
+      read_array(fd, &mesh->regionlist, std::uint64_t(regions) * 5);
+  if (!arrays_ok) {
+    delete[] point_origin_values;
+    delete[] edge_support_values;
+    delete[] plc_triangles;
+    return false;
+  }
+  mesh->numberofpointattributes = edge_supports ? 3 :
+      (point_origins ? 1 : 0);
+  if (mesh->numberofpointattributes) {
+    mesh->pointattributelist =
+        new REAL[std::uint64_t(points) * mesh->numberofpointattributes];
+    for (int point = 0; point < points; ++point) {
+      auto const offset = point * mesh->numberofpointattributes;
+      mesh->pointattributelist[offset] =
+          point_origins ? point_origin_values[point] : REAL(-1);
+      if (edge_supports) {
+        mesh->pointattributelist[offset + 1] =
+            edge_support_values[2 * point];
+        mesh->pointattributelist[offset + 2] =
+            edge_support_values[2 * point + 1];
+      }
+    }
+  }
+  delete[] point_origin_values;
+  delete[] edge_support_values;
+  mesh->numberoffacets = plc_facets;
+  mesh->numberofregions = regions;
+  if (plc_facets) {
+    mesh->facetlist = new tetgenio::facet[plc_facets];
+    for (int facet = 0; facet < plc_facets; ++facet) {
+      auto& f = mesh->facetlist[facet];
+      f.numberofpolygons = 1;
+      f.polygonlist = new tetgenio::polygon[1];
+      f.numberofholes = 0;
+      f.holelist = nullptr;
+      f.polygonlist[0].numberofvertices = 3;
+      f.polygonlist[0].vertexlist = new int[3];
+      for (int corner = 0; corner < 3; ++corner)
+        f.polygonlist[0].vertexlist[corner] =
+            plc_triangles[3 * facet + corner];
+    }
+  }
+  delete[] plc_triangles;
+  return true;
 }
 
 bool write_mesh(int fd, tetgenio const& mesh) {
   auto const point_markers = std::uint8_t(mesh.pointmarkerlist != nullptr);
-  auto const point_origins = std::uint8_t(mesh.pointattributelist != nullptr);
+  auto const point_origins = std::uint8_t(
+      mesh.pointattributelist != nullptr && mesh.numberofpointattributes > 0);
+  auto const edge_supports = std::uint8_t(0);
   auto const face_markers = std::uint8_t(mesh.trifacemarkerlist != nullptr);
   auto const edge_markers = std::uint8_t(mesh.edgemarkerlist != nullptr);
+  // PLC facets are input-only. TetGen reports the recovered surface through
+  // trifacelist, so output requests carry an empty PLC section.
+  auto const plc_markers = std::uint8_t(0);
   return write_scalar(fd, std::int32_t(mesh.firstnumber)) &&
       write_scalar(fd, std::int32_t(mesh.numberofpoints)) &&
       write_scalar(fd, std::int32_t(mesh.numberoftetrahedra)) &&
@@ -162,14 +223,22 @@ bool write_mesh(int fd, tetgenio const& mesh) {
       write_scalar(fd, std::int32_t(mesh.numberoftetrahedronattributes)) &&
       write_scalar(fd, std::int32_t(mesh.numberoftrifaces)) &&
       write_scalar(fd, std::int32_t(mesh.numberofedges)) &&
+      write_scalar(fd, std::int32_t(0)) && write_scalar(fd, std::int32_t(0)) &&
       write_scalar(fd, point_markers) && write_scalar(fd, point_origins) &&
       write_scalar(fd, face_markers) && write_scalar(fd, edge_markers) &&
+      write_scalar(fd, edge_supports) &&
+      write_scalar(fd, plc_markers) &&
       write_array(fd, mesh.pointlist,
           std::uint64_t(mesh.numberofpoints) * 3) &&
       (!point_markers || write_array(
           fd, mesh.pointmarkerlist, mesh.numberofpoints)) &&
-      (!point_origins || write_array(
-          fd, mesh.pointattributelist, mesh.numberofpoints)) &&
+      (!point_origins || [&]() {
+        std::vector<REAL> origins(mesh.numberofpoints);
+        for (int point = 0; point < mesh.numberofpoints; ++point)
+          origins[point] = mesh.pointattributelist[
+              std::uint64_t(point) * mesh.numberofpointattributes];
+        return write_array(fd, origins.data(), origins.size());
+      }()) &&
       write_array(fd, mesh.tetrahedronlist,
           std::uint64_t(mesh.numberoftetrahedra) * mesh.numberofcorners) &&
       write_array(fd, mesh.tetrahedronattributelist,

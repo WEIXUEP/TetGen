@@ -727,6 +727,10 @@ public:
   // R2 quality candidate controls (set by the adapter/environment).
   REAL coarsen_candidate_percent;
   REAL coarsen_quality_threshold;
+  // R2 surface deletions are tried before their discrete PLC is accepted.
+  // A failed trial restarts from the immutable input while skipping its mark.
+  std::vector<int> r2_plc_rejected_pointmarks;
+  int r2_plc_retry_pointmark;
   REAL elem_growth_ratio;             // Growth ratio of # elements, -r#, 0.0.
   REAL refine_progress_ratio;                                  // -r/#, 0.333.
 
@@ -859,6 +863,8 @@ public:
     coarsen_eligible_count = 0;
     coarsen_candidate_percent = 0.05;
     coarsen_quality_threshold = 0.1;
+    r2_plc_rejected_pointmarks.clear();
+    r2_plc_retry_pointmark = -1;
     metric_scale = 1.0; // -m#
     elem_growth_ratio = 0.0; // -r#
     refine_progress_ratio = 0.333; // -r/#
