@@ -66,6 +66,20 @@ static void tetgen_read_r2_controls(tetgenbehavior* b)
   }
 }
 
+// Bound the recursive edge-reduction search for one R2 candidate. A single
+// pathological star must not delay the rest of the coarsening batch. Set
+// TETGEN_R2_FLIPNM_BUDGET=0 to restore the legacy unlimited search.
+static long tetgen_r2_flipnm_budget()
+{
+  const long default_budget = 100000l;
+  const char* raw = getenv("TETGEN_R2_FLIPNM_BUDGET");
+  if (raw == NULL || *raw == '\0') return default_budget;
+  char* end = NULL;
+  long value = strtol(raw, &end, 10);
+  if (end != raw && *end == '\0' && value >= 0) return value;
+  return default_budget;
+}
+
 //== io_cxx ==================================================================//
 //                                                                            //
 //                                                                            //
@@ -3822,6 +3836,28 @@ bool tetgenbehavior::parse_commandline(int argc, char **argv)
             shellfaceperblock = vertexperblock / 2;
           } else {
             tetrahedraperblock = 8188;
+          }
+        }
+      } else if (argv[i][j] == 'u') {
+        // Application-facing add-in batch sliver policy:
+        //   -u0     reject scale-negligible 2-to-3 flips (default)
+        //   -u1/#   repair them after the completed batch, with at most #
+        //            extra interior repair points.
+        if (argv[i][j + 1] >= '0' && argv[i][j + 1] <= '1') {
+          batch_sliver_post_repair = argv[i][j + 1] - '0';
+          j++;
+        }
+        if ((argv[i][j + 1] == '/') || (argv[i][j + 1] == ',')) {
+          j++;
+          if (argv[i][j + 1] >= '0' && argv[i][j + 1] <= '9') {
+            k = 0;
+            while (argv[i][j + 1] >= '0' && argv[i][j + 1] <= '9') {
+              j++;
+              workstring[k++] = argv[i][j];
+            }
+            workstring[k] = '\0';
+            batch_sliver_repair_point_budget =
+                (int) strtol(workstring, (char **) NULL, 0);
           }
         }
       } else if (argv[i][j] == 'H') {
@@ -8374,6 +8410,18 @@ void tetgenmesh::flip41(triface* fliptets, int hullflag, flipconstraints *fc)
 int tetgenmesh::flipnm(triface* abtets, int n, int level, int abedgepivot,
                        flipconstraints* fc)
 {
+  if (fc != NULL && fc->coarsen_quality_gate) {
+    if (fc->r2_flipnm_budget > 0 &&
+        fc->r2_flipnm_calls >= fc->r2_flipnm_budget) {
+      fc->r2_flipnm_budget_exhausted = 1;
+      return n;
+    }
+    fc->r2_flipnm_calls++;
+  }
+  if (r2_candidate_diagnostics_active) {
+    r2_flipnm_calls++;
+    if (level > r2_flipnm_max_depth) r2_flipnm_max_depth = level;
+  }
   triface fliptets[3], spintet, flipedge;
   triface *tmpabtets, *parytet;
   point pa, pb, pc, pd, pe, pf;
@@ -8385,6 +8433,8 @@ int tetgenmesh::flipnm(triface* abtets, int n, int level, int abedgepivot,
   int n1, nn;
   int t1ver;
   int i, j;
+
+  if (fc != NULL && fc->r2_flipnm_budget_exhausted) return n;
 
   pa = org(abtets[0]);
   pb = dest(abtets[0]);
@@ -8593,6 +8643,8 @@ int tetgenmesh::flipnm(triface* abtets, int n, int level, int abedgepivot,
               }
             } // if (unflip || (ori == 0))
           } // if (nn > 2)
+
+          if (fc->r2_flipnm_budget_exhausted) return n;
 
           if (!fc->unflip) {
             // The flips are not reversed. The current Star(ab) can not be
@@ -8825,6 +8877,8 @@ int tetgenmesh::flipnm(triface* abtets, int n, int level, int abedgepivot,
                 delete [] tmpabtets;
               } // if (unflip)
             } // if (nn > 2)
+
+            if (fc->r2_flipnm_budget_exhausted) return n;
 
             if (!fc->unflip) {
               // The flips are not reversed. The current Star(ab) can not be
@@ -18683,8 +18737,45 @@ bool tetgenmesh::is_segment(point p1, point p2)
 //                                                                            //
 //============================================================================//
 
+bool tetgenmesh::near_degenerate_tet(point pa, point pb, point pc, point pd)
+{
+  REAL max_edge_squared = 0.0;
+  point points[4] = {pa, pb, pc, pd};
+  for (int u = 0; u < 4; ++u) {
+    for (int v = u + 1; v < 4; ++v) {
+      REAL edge_squared = distance(points[u], points[v]);
+      edge_squared *= edge_squared;
+      if (edge_squared > max_edge_squared) max_edge_squared = edge_squared;
+    }
+  }
+  REAL scale = max_edge_squared * sqrt(max_edge_squared);
+  if (scale < 1.0) scale = 1.0;
+  REAL determinant = fabs(orient3d(pa, pb, pc, pd));
+  return !isfinite(determinant) || determinant <= 1.0e-12 * scale;
+}
+
 bool tetgenmesh::valid_constrained_f23(triface& checktet, point pd, point pe, int f44)
 {
+  // A positive orientation is insufficient for application-facing add-in
+  // batches: a 2-to-3 flip may still create a scale-negligible tetrahedron.
+  // Apply this only to final new tets. The first tet of the internal 4-to-4
+  // sequence is intentionally flat and is immediately consumed by its 3-to-2
+  // half, so it is excluded when f44 is set.
+  if (b->refine && b->insertaddpoints &&
+      (!b->batch_sliver_post_repair || batch_sliver_repair_active) &&
+      pd != dummypoint && pe != dummypoint) {
+    for (int k = 0; k < 3; ++k) {
+      point pa = org(checktet);
+      point pb = dest(checktet);
+      if (!((f44 > 0) && (k == 0)) &&
+          pa != dummypoint && pb != dummypoint &&
+          near_degenerate_tet(pe, pd, pa, pb)) {
+        return false;
+      }
+      enextself(checktet);
+    }
+  }
+
   if (b->flip_valid_angles) {
     if ((pd != dummypoint) && (pe != dummypoint)) {
       REAL costheta;
@@ -19008,6 +19099,9 @@ int tetgenmesh::checkflipeligibility(int fliptype, point pa, point pb,
     }
   }
 
+  if (r2_candidate_diagnostics_active && fc->coarsen_quality_gate && rejflag)
+    r2_topology_rejections++;
+
   if (fc->coarsen_quality_gate && !rejflag) {
     // Ignore the one temporary output which remains incident to remvert and
     // is consumed by the recursive edge reduction. Gate every persistent
@@ -19033,6 +19127,8 @@ int tetgenmesh::checkflipeligibility(int fliptype, point pa, point pb,
         if (coarsen_mean_ratio(pa, pb, pc, pd) < floor) rejflag = 1;
       }
     }
+    if (r2_candidate_diagnostics_active && rejflag)
+      r2_quality_gate_rejections++;
   }
 
   if (fc->remove_large_angle && !rejflag) {
@@ -19185,6 +19281,8 @@ int tetgenmesh::checkflipeligibility(int fliptype, point pa, point pb,
 
 int tetgenmesh::removeedgebyflips(triface *flipedge, flipconstraints* fc)
 {
+  long const quality_rejections_before = r2_quality_gate_rejections;
+  if (r2_candidate_diagnostics_active) r2_removeedge_attempts++;
   triface *abtets, spintet;
   int t1ver; 
   int n, nn, i;
@@ -19203,6 +19301,8 @@ int tetgenmesh::removeedgebyflips(triface *flipedge, flipconstraints* fc)
           *paryseg = checkseg;
         }
       }
+      if (r2_candidate_diagnostics_active)
+        r2_topology_rejections++;
       return 0;
     }
   }
@@ -19224,6 +19324,8 @@ int tetgenmesh::removeedgebyflips(triface *flipedge, flipconstraints* fc)
 
   if (fc->noflip_in_surface) {
     if (subface_count > 0) {
+      if (r2_candidate_diagnostics_active)
+        r2_topology_rejections++;
       return 0;
     }
   }
@@ -19231,6 +19333,8 @@ int tetgenmesh::removeedgebyflips(triface *flipedge, flipconstraints* fc)
   //if ((b->flipstarsize > 0) && (n > (b->flipstarsize+4))) {
   if ((b->flipstarsize > 0) && (n > b->flipstarsize)) {
     // The star size exceeds the limit.
+    if (r2_candidate_diagnostics_active)
+      r2_topology_rejections++;
     return 0; // Do not flip it.
   }
 
@@ -19247,6 +19351,10 @@ int tetgenmesh::removeedgebyflips(triface *flipedge, flipconstraints* fc)
 
   // Try to flip the edge (level = 0, edgepivot = 0).
   nn = flipnm(abtets, n, 0, 0, fc);
+
+  if (r2_candidate_diagnostics_active && nn > 2 &&
+      r2_quality_gate_rejections == quality_rejections_before)
+    r2_topology_rejections++;
 
 
   if (nn > 2) {
@@ -22604,6 +22712,8 @@ int tetgenmesh::removevertexbyflips(point steinerpt, flipconstraints &fc)
       // A FREEFACETVERTEX reaching the volume-style 4-to-1 configuration
       // needs a separate surface 3-to-1 quality proof. Keep it unchanged
       // rather than accepting a deletion based only on volume quality.
+      if (r2_candidate_diagnostics_active)
+        r2_topology_rejections++;
       return 0;
     } else if (loc == ONFACE) {
       // The native 6-to-2 operation creates [a,b,c,d] and [b,a,c,e].
@@ -22621,11 +22731,21 @@ int tetgenmesh::removevertexbyflips(point steinerpt, flipconstraints &fc)
       final_minimum = std::min(coarsen_mean_ratio(pa, pb, pc, pd),
                                coarsen_mean_ratio(pb, pa, pc, pe));
       if (coarsen_triangle_mean_ratio(pa, pb, pc) <
-          fc.coarsen_surface_quality_floor) return 0;
+          fc.coarsen_surface_quality_floor) {
+        if (r2_candidate_diagnostics_active)
+          r2_quality_gate_rejections++;
+        return 0;
+      }
     } else {
+      if (r2_candidate_diagnostics_active)
+        r2_topology_rejections++;
       return 0;
     }
-    if (final_minimum < fc.coarsen_quality_floor) return 0;
+    if (final_minimum < fc.coarsen_quality_floor) {
+      if (r2_candidate_diagnostics_active)
+        r2_quality_gate_rejections++;
+      return 0;
+    }
   }
 
   if (vt == FREESEGVERTEX) {
@@ -23311,6 +23431,9 @@ bool tetgenmesh::removefacetvertexbyquality(point rempt)
   fc.enqflag = 0;
   fc.unflip = 1;
   fc.coarsen_quality_gate = 1;
+  fc.r2_flipnm_budget = tetgen_r2_flipnm_budget();
+  r2_flipnm_budget = fc.r2_flipnm_budget;
+  r2_flipnm_budget_exhausted = false;
   REAL tolerance = 64.0 * b->epsilon;
   // A surface operation is accepted for a strict surface-quality gain while
   // preserving the old volume-star minimum within floating-point tolerance.
@@ -23323,6 +23446,7 @@ bool tetgenmesh::removefacetvertexbyquality(point rempt)
   // subfaces still prevent it from crossing a CAD or material boundary.
   if (original_type == FACETVERTEX) setpointtype(rempt, FREEFACETVERTEX);
   bool removed = removevertexbyflips(rempt, fc) != 0;
+  r2_flipnm_budget_exhausted = fc.r2_flipnm_budget_exhausted != 0;
   if (original_type == FACETVERTEX) {
     if (removed) {
       // removevertexbyflips() accounted for a Steiner facet vertex because of
@@ -27596,8 +27720,45 @@ void tetgenmesh::meshcoarsening()
         }
         continue;
       }
+      // These are per-candidate diagnostics. Clear them before trying a
+      // volume candidate so a previous surface timeout cannot leak into its
+      // report.
+      r2_flipnm_budget = 0l;
+      r2_flipnm_budget_exhausted = false;
       attempts++;
       bool accepted = false;
+      long incident_tets = 0;
+      long incident_neighbors = 0;
+      long incident_surface_triangles = 0;
+      bool trace_candidate = getenv("TETGEN_DEBUG_R2_CANDIDATES") != NULL;
+      if (trace_candidate) {
+        getvertexstar(1, *parypt, cavetetlist, cavetetvertlist, NULL);
+        incident_tets = cavetetlist->objects;
+        incident_neighbors = cavetetvertlist->objects;
+        cavetetlist->restart();
+        cavetetvertlist->restart();
+        if ((candidate_type == FACETVERTEX) ||
+            (candidate_type == FREEFACETVERTEX)) {
+          subfaces->traversalinit();
+          face candidate_face;
+          candidate_face.shver = 0;
+          candidate_face.sh = shellfacetraverse(subfaces);
+          while (candidate_face.sh != NULL) {
+            if ((sorg(candidate_face) == *parypt) ||
+                (sdest(candidate_face) == *parypt) ||
+                (sapex(candidate_face) == *parypt))
+              incident_surface_triangles++;
+            candidate_face.sh = shellfacetraverse(subfaces);
+          }
+        }
+        r2_candidate_diagnostics_active = true;
+        r2_removeedge_attempts = 0;
+        r2_flipnm_calls = 0;
+        r2_flipnm_max_depth = 0;
+        r2_quality_gate_rejections = 0;
+        r2_topology_rejections = 0;
+      }
+      clock_t const candidate_start = clock();
       if ((candidate_type == VOLVERTEX) ||
           (candidate_type == FREEVOLVERTEX)) {
         accepted = collapsevertexbyquality(*parypt);
@@ -27606,6 +27767,27 @@ void tetgenmesh::meshcoarsening()
                  (candidate_type == FREEFACETVERTEX)) {
         accepted = removefacetvertexbyquality(*parypt);
         if (accepted) surface_committed++;
+      }
+      clock_t const candidate_end = clock();
+      if (trace_candidate) {
+        REAL const elapsed_us = 1.0e6 *
+            (REAL) (candidate_end - candidate_start) /
+            (REAL) CLOCKS_PER_SEC;
+        fprintf(stderr,
+            "[tetgen-r2-candidate-detail] mark=%d type=%d "
+            "elapsed_us=%.0f incident_tets=%ld "
+            "surface_triangles=%ld neighbors=%ld "
+            "removeedge_attempts=%ld flipnm_calls=%ld "
+            "max_depth=%d quality_gate_rejections=%ld "
+            "topology_rejections=%ld accepted=%d "
+            "work_budget=%ld work_budget_exhausted=%d\n",
+            pointmark(*parypt), (int) candidate_type, elapsed_us,
+            incident_tets, incident_surface_triangles, incident_neighbors,
+            r2_removeedge_attempts, r2_flipnm_calls, r2_flipnm_max_depth,
+            r2_quality_gate_rejections, r2_topology_rejections,
+            accepted ? 1 : 0, r2_flipnm_budget,
+            r2_flipnm_budget_exhausted ? 1 : 0);
+        r2_candidate_diagnostics_active = false;
       }
       if (getenv("TETGEN_DEBUG_R2_CANDIDATES") != NULL) {
         fprintf(stderr, "[tetgen-r2-candidate] mark=%d type=%d accepted=%d\n",
@@ -32273,6 +32455,7 @@ long tetgenmesh::lawsonflip3d(flipconstraints *fc)
   REAL vol, len3;
   long flipcount, totalcount = 0l;
   long sliver_peels = 0l;
+  long near_degenerate_rejections = 0l;
   int t1ver;
   int i;
 
@@ -32419,6 +32602,28 @@ long tetgenmesh::lawsonflip3d(flipconstraints *fc)
           // A 2-to-3 flip is found.
           //   [0] [a,b,c,d],
           //   [1] [b,a,c,e]. no dummypoint.
+          // The orientation test above only proves that the proposed tets
+          // have positive volume.  It does not prevent a floating-point
+          // positive but scale-negligible volume.  This is the exact failure
+          // mode that can leave a sliver after an edge-fan insertion.  Keep
+          // the flip Delaunay-safe, but reject it when any of its three new
+          // tets violates the same scale-aware floor used by the Omega_h
+          // bridge.  Restrict this guard to reconstruct/add-in transactions;
+          // ordinary TetGen generation retains its historical behavior.
+          if (b->refine && b->insertaddpoints &&
+              (!b->batch_sliver_post_repair || batch_sliver_repair_active)) {
+            point pa = org(fliptets[0]);
+            point pb = dest(fliptets[0]);
+            point pc = apex(fliptets[0]);
+            point pd = oppo(fliptets[0]);
+            point pe = oppo(fliptets[1]);
+            if (near_degenerate_tet(pe, pd, pa, pb) ||
+                near_degenerate_tet(pe, pd, pb, pc) ||
+                near_degenerate_tet(pe, pd, pc, pa)) {
+              ++near_degenerate_rejections;
+              continue;
+            }
+          }
           flip23(fliptets, 0, fc);
           flipcount++;
           if (fc->remove_ndelaunay_edge) {
@@ -32674,6 +32879,10 @@ long tetgenmesh::lawsonflip3d(flipconstraints *fc)
     }
     if (sliver_peels > 0) {
       printf("      Removed %ld hull slivers.\n", sliver_peels);
+    }
+    if (near_degenerate_rejections > 0) {
+      printf("      Rejected %ld near-degenerate 2-to-3 flips.\n",
+             near_degenerate_rejections);
     }
     //if (unflipqueue->objects > 0l) {
     //  printf("      %ld unflippable edges remained.\n", unflipqueue->objects);
@@ -34606,7 +34815,11 @@ bool tetgenmesh::collapsevertexbyquality(point rempt)
     if ((keep_type != VOLVERTEX) && (keep_type != FREEVOLVERTEX)) continue;
     triface edge;
     edge.tet = NULL;
-    if (!getedge(rempt, keeppt, &edge)) continue;
+    if (!getedge(rempt, keeppt, &edge)) {
+      if (r2_candidate_diagnostics_active)
+        r2_topology_rejections++;
+      continue;
+    }
 
     // A volume collapse must not remove or retriangulate a PLC subface.
     bool constrained_edge = false;
@@ -34618,7 +34831,11 @@ bool tetgenmesh::collapsevertexbyquality(point rempt)
       }
       fnextself(spin);
     } while (spin.tet != edge.tet);
-    if (constrained_edge) continue;
+    if (constrained_edge) {
+      if (r2_candidate_diagnostics_active)
+        r2_topology_rejections++;
+      continue;
+    }
 
     REAL minimum = 1.0;
     REAL sum = 0.0;
@@ -34650,9 +34867,17 @@ bool tetgenmesh::collapsevertexbyquality(point rempt)
       sum += quality;
       count++;
     }
-    if (!valid || (count == 0)) continue;
+    if (!valid || (count == 0)) {
+      if (r2_candidate_diagnostics_active)
+        r2_topology_rejections++;
+      continue;
+    }
     REAL average = sum / count;
-    if (minimum <= quality_before * (1.0 + tolerance)) continue;
+    if (minimum <= quality_before * (1.0 + tolerance)) {
+      if (r2_candidate_diagnostics_active)
+        r2_quality_gate_rejections++;
+      continue;
+    }
     if ((best_neighbor == NULL) ||
         (minimum > best_minimum * (1.0 + tolerance)) ||
         ((fabs(minimum - best_minimum) <= tolerance * best_minimum) &&
@@ -34663,14 +34888,26 @@ bool tetgenmesh::collapsevertexbyquality(point rempt)
     }
   }
 
-  if (best_neighbor == NULL) return false;
+  if (best_neighbor == NULL) {
+    if (r2_candidate_diagnostics_active)
+      r2_quality_gate_rejections++;
+    return false;
+  }
   triface bestedge;
   bestedge.tet = NULL;
-  if (!getedge(rempt, best_neighbor, &bestedge)) return false;
+  if (!getedge(rempt, best_neighbor, &bestedge)) {
+    if (r2_candidate_diagnostics_active)
+      r2_topology_rejections++;
+    return false;
+  }
   // The preflight above is the quality transaction.  These sentinel quality
   // arguments suppress the older aspect/dihedral sampler; the destination is
   // fixed and the exact replacement cavity has already been validated.
-  return collapse_edge_to_improve(&bestedge, 0.0, -2.0, 1);
+  bool const collapsed =
+      collapse_edge_to_improve(&bestedge, 0.0, -2.0, 1);
+  if (!collapsed && r2_candidate_diagnostics_active)
+    r2_topology_rejections++;
+  return collapsed;
 }
 
 //============================================================================//
@@ -35290,7 +35527,9 @@ long tetgenmesh::repair_badqual_tets(bool bFlips, bool bCollapse, bool bSteiners
               unmarktest2(*bface);
               if (!ishulltet(*bface)) {
                 get_tetqual(bface, NULL, &bf);
-                if ((bf.key > que_max_asp) || (bf.cent[0] < que_cosmaxd)) {
+                if ((!b->refine || !b->insertaddpoints || bf.ss.shver > 0) &&
+                    ((bf.key > que_max_asp) ||
+                     (bf.cent[0] < que_cosmaxd))) {
                   bf.forg  =  org(bf.tt);
                   bf.fdest = dest(bf.tt);
                   bf.fapex = apex(bf.tt);
@@ -35327,6 +35566,140 @@ long tetgenmesh::repair_badqual_tets(bool bFlips, bool bCollapse, bool bSteiners
   } // if (unsplit_badtets->objects > 0l)
 
   return repaired_count;
+}
+
+//============================================================================//
+//                                                                            //
+// repair_batch_slivers()  Repair scale-negligible tets after an add-in batch.//
+//                                                                            //
+// This is the experimental counterpart to the pre-flip guard. Input and     //
+// mandatory add-in vertices remain fixed. Local flips are tried first, then  //
+// a strictly budgeted interior Steiner insertion. A repair point which does  //
+// not eliminate the local defect may be removed again, but pre-existing and //
+// mandatory vertices are never deletion candidates.                         //
+//                                                                            //
+//============================================================================//
+
+long tetgenmesh::repair_batch_slivers()
+{
+  if (!b->refine || !b->insertaddpoints ||
+      !b->batch_sliver_post_repair) return 0;
+
+  int const blocksize = b->tetrahedraperblock;
+  badqual_tets_pool =
+      new memorypool(sizeof(badface), blocksize, sizeof(void *), 0);
+  badtetrahedrons =
+      new memorypool(sizeof(triface), blocksize, sizeof(void *), 0);
+  unsplit_badtets = new arraypool(sizeof(badface), 10);
+  for (int queue = 0; queue < 64; ++queue) {
+    bt_queuefront[queue] = NULL;
+    bt_queuetail[queue] = NULL;
+    bt_nextnonemptyq[queue] = -1;
+  }
+  bt_firstnonemptyq = -1;
+  bt_recentq = -1;
+
+  cos_large_dihed = cos(165.0 / 180.0 * PI);
+  cosmaxdihed = cos(b->optmaxdihedral / 180.0 * PI);
+  REAL sliver_angle = b->optmaxdihedral - 5.0;
+  if (sliver_angle < 172.0) sliver_angle = 172.0;
+  cossmtdihed = cos(sliver_angle / 180.0 * PI);
+  REAL split_angle = b->optmaxdihedral + 10.0;
+  if (split_angle < 179.0) split_angle = 179.0;
+  else if (split_angle > 180.0) split_angle = 179.9;
+  cosslidihed = cos(split_angle / 180.0 * PI);
+  opt_max_sliver_asp_ratio = b->opt_max_asp_ratio * 10.0;
+
+  auto count_and_queue = [&](bool enqueue) -> long {
+    long count = 0;
+    tetrahedrons->traversalinit();
+    tetrahedron *raw = tetrahedrontraverse();
+    while (raw != NULL) {
+      triface tet;
+      tet.tet = raw;
+      tet.ver = 11;
+      if (!ishulltet(tet)) {
+        point *vertices = (point *) &(raw[4]);
+        if (near_degenerate_tet(
+                vertices[0], vertices[1], vertices[2], vertices[3])) {
+          ++count;
+          if (enqueue) {
+            badface bf;
+            if (get_tetqual(&tet, NULL, &bf)) enqueue_badtet(&bf);
+          }
+        }
+      }
+      raw = tetrahedrontraverse();
+    }
+    return count;
+  };
+
+  long const detected = count_and_queue(true);
+  long repaired_operations = 0;
+  long deleted_repair_points = 0;
+  long const repair_mark_floor = points->items + in->firstnumber;
+  long const points_before = points->items;
+  long const saved_steinerleft = steinerleft;
+  int const saved_fliplinklevel = b->fliplinklevel;
+  int const saved_flipstarsize = b->flipstarsize;
+  int const saved_autofliplinklevel = autofliplinklevel;
+
+  batch_sliver_repair_active = true;
+  b->fliplinklevel = 1;
+  b->flipstarsize = 10;
+  if (detected > 0) {
+    repaired_operations += repair_badqual_tets(true, false, false, false,
+        false, b->opt_max_asp_ratio, cosmaxdihed);
+    if (badqual_tets_pool->items > 0 &&
+        b->batch_sliver_repair_point_budget > 0) {
+      steinerleft = b->batch_sliver_repair_point_budget;
+      repaired_operations += repair_badqual_tets(true, false, true, false,
+          true, opt_max_sliver_asp_ratio, cosslidihed);
+    }
+  }
+
+  // Only points created by this repair pass are eligible for cleanup
+  // deletion. This preserves the add-in prefix and every frozen input node.
+  if (count_and_queue(false) > 0 && points->items > points_before) {
+    std::vector<point> repair_points;
+    points->traversalinit();
+    point candidate = pointtraverse();
+    while (candidate != NULL) {
+      if (pointmark(candidate) >= repair_mark_floor &&
+          pointtype(candidate) == FREEVOLVERTEX)
+        repair_points.push_back(candidate);
+      candidate = pointtraverse();
+    }
+    for (size_t i = 0; i < repair_points.size(); ++i) {
+      if (pointtype(repair_points[i]) == FREEVOLVERTEX &&
+          collapsevertexbyquality(repair_points[i]))
+        ++deleted_repair_points;
+    }
+  }
+
+  long const unresolved = count_and_queue(false);
+  long const retained_repair_points =
+      std::max(0l, points->items - points_before);
+  fprintf(stderr,
+      "[tetgen-batch-sliver] strategy=post-repair detected=%ld "
+      "repaired_ops=%ld retained_repair_points=%ld "
+      "deleted_repair_points=%ld unresolved=%ld\n",
+      detected, repaired_operations, retained_repair_points,
+      deleted_repair_points, unresolved);
+  fflush(stderr);
+
+  batch_sliver_repair_active = false;
+  steinerleft = saved_steinerleft;
+  b->fliplinklevel = saved_fliplinklevel;
+  b->flipstarsize = saved_flipstarsize;
+  autofliplinklevel = saved_autofliplinklevel;
+  delete badtetrahedrons;
+  badtetrahedrons = NULL;
+  delete badqual_tets_pool;
+  badqual_tets_pool = NULL;
+  delete unsplit_badtets;
+  unsplit_badtets = NULL;
+  return unresolved;
 }
 
 //============================================================================//
@@ -35586,7 +35959,9 @@ void tetgenmesh::improve_mesh()
       }
     }
     if (get_tetqual(&checktet, NULL, &bf)) {
-      if ((bf.key > b->opt_max_asp_ratio) || (bf.cent[0] < cosmaxdihed)) {
+      if ((!b->refine || !b->insertaddpoints || bf.ss.shver > 0) &&
+          ((bf.key > b->opt_max_asp_ratio) ||
+           (bf.cent[0] < cosmaxdihed))) {
         bf.forg  =  org(bf.tt);
         bf.fdest = dest(bf.tt);
         bf.fapex = apex(bf.tt);
@@ -40826,6 +41201,13 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
       tetrahedralize(b, in, out, addin, bgmin);
       return;
     }
+  }
+
+  // Repair inside this worker transaction, after this batch's insertion,
+  // deferred Delaunay recovery, and ordinary improvement. No second worker
+  // request is needed: Omega_h receives the repaired result of this call.
+  if (b->refine && b->insertaddpoints && b->batch_sliver_post_repair) {
+    m.repair_batch_slivers();
   }
 
   tv[11] = clock();

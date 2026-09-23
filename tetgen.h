@@ -684,6 +684,10 @@ public:
   // Active tetrahedra at the processed candidate boundary before deferred
   // Delaunay/quality work, whether or not the target caused an early stop.
   long addin_stop_tetrahedra;
+  // Omega_h add-in batch sliver policy. The default prevents a
+  // scale-negligible 2-to-3 result; mode 1 repairs after the completed batch.
+  int batch_sliver_post_repair;
+  int batch_sliver_repair_point_budget;
   
   // Parameters
   int vertexperblock;                                           // '-x', 4092.
@@ -829,6 +833,8 @@ public:
     addin_target_tetrahedra = -1;
     processed_addin_points = -1;
     addin_stop_tetrahedra = -1;
+    batch_sliver_post_repair = 0;
+    batch_sliver_repair_point_budget = 0;
 
     vertexperblock = 4092;
     tetrahedraperblock = 8188;
@@ -1319,6 +1325,12 @@ public:
     int coarsen_quality_gate;
     REAL coarsen_quality_floor;
     REAL coarsen_surface_quality_floor;
+    // R2 edge-reduction search guard. The counter is shared by recursive
+    // flipnm() calls for one candidate so a pathological star cannot spend
+    // unbounded time exploring quality-rejected alternatives.
+    long r2_flipnm_calls;
+    long r2_flipnm_budget; // 0 disables the guard.
+    int r2_flipnm_budget_exhausted;
 
     // Boundary recovery flags.
     int checkflipeligibility;
@@ -1346,6 +1358,9 @@ public:
       coarsen_quality_gate = 0;
       coarsen_quality_floor = 0.0;
       coarsen_surface_quality_floor = 0.0;
+      r2_flipnm_calls = 0l;
+      r2_flipnm_budget = 0l;
+      r2_flipnm_budget_exhausted = 0;
 
       checkflipeligibility = 0;
       seg[0] = NULL;
@@ -1583,6 +1598,17 @@ public:
   long flip31count, flip22count;
   long opt_flips_count, opt_collapse_count, opt_smooth_count;
   long recover_delaunay_count;
+  bool batch_sliver_repair_active;
+  // Per-candidate R2 diagnostics. These counters are active only while
+  // TETGEN_DEBUG_R2_CANDIDATES is tracing one coarsening candidate.
+  bool r2_candidate_diagnostics_active;
+  long r2_removeedge_attempts;
+  long r2_flipnm_calls;
+  long r2_flipnm_budget;
+  bool r2_flipnm_budget_exhausted;
+  int r2_flipnm_max_depth;
+  long r2_quality_gate_rejections;
+  long r2_topology_rejections;
   unsigned long totalworkmemory;      // Total memory used by working arrays.
 
 
@@ -2133,6 +2159,7 @@ public:
   bool is_collinear_at(point mid, point left, point right);
   bool is_segment(point p1, point p2);
   bool valid_constrained_f23(triface& flipface, point pd, point pe, int f44);
+  bool near_degenerate_tet(point pa, point pb, point pc, point pd);
   bool valid_constrained_f32(triface*, point pa, point pb);
   int  checkflipeligibility(int fliptype, point, point, point, point, point,
                             int level, int edgepivot, flipconstraints* fc);
@@ -2307,6 +2334,7 @@ public:
   bool repair_tet(badface *bf, bool bFlips, bool bCollapse, bool bSteiners, bool bSmooth);
   long repair_badqual_tets(bool bFlips, bool bCollapse, bool bSteiners, bool bSmooth, bool, REAL, REAL);
   long improve_surface_triangulation();
+  long repair_batch_slivers();
   void improve_mesh();
 
 //============================================================================//
@@ -2481,6 +2509,15 @@ public:
     flip23count = flip32count = flip44count = flip41count = 0l;
     flip22count = flip31count = 0l;
     recover_delaunay_count = 0l;
+    batch_sliver_repair_active = false;
+    r2_candidate_diagnostics_active = false;
+    r2_removeedge_attempts = 0l;
+    r2_flipnm_calls = 0l;
+    r2_flipnm_budget = 0l;
+    r2_flipnm_budget_exhausted = false;
+    r2_flipnm_max_depth = 0;
+    r2_quality_gate_rejections = 0l;
+    r2_topology_rejections = 0l;
     opt_flips_count = opt_collapse_count = opt_smooth_count = 0l;
     totalworkmemory = 0l;
 
