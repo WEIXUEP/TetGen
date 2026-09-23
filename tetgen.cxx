@@ -31621,8 +31621,11 @@ void tetgenmesh::delaunayrefinement()
       // later improve_mesh() stages.  Leaving steinerleft at the baseline
       // value here made those stages insert exactly that many extra points
       // even when the application requested a zero new-point budget.
+      // Keep building the refinement/quality-stage indexes below.  The zero
+      // budget is consumed by force_quit_refinement after those maps and
+      // queues are initialized; returning here leaves PLC adjacency maps
+      // null while improve_mesh() can still inspect constrained edges.
       steinerleft = 0;
-      return; // No more Steiner points.
     }
   }
 
