@@ -677,6 +677,13 @@ public:
   // Application-facing refinement budgets count only vertices added by this
   // invocation. Native -S also counts reconstructed Steiner vertices.
   int new_point_budget;
+  // Optional add-in stopping contract; offsets are cumulative point counts.
+  long addin_target_tetrahedra;
+  std::vector<int> addin_candidate_ends;
+  int processed_addin_points;
+  // Active tetrahedra at the processed candidate boundary before deferred
+  // Delaunay/quality work, whether or not the target caused an early stop.
+  long addin_stop_tetrahedra;
   
   // Parameters
   int vertexperblock;                                           // '-x', 4092.
@@ -819,6 +826,9 @@ public:
     nometricswritten = 0;
     exact_refinement_target = 0;
     new_point_budget = -1;
+    addin_target_tetrahedra = -1;
+    processed_addin_points = -1;
+    addin_stop_tetrahedra = -1;
 
     vertexperblock = 4092;
     tetrahedraperblock = 8188;

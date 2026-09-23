@@ -26916,6 +26916,13 @@ void tetgenmesh::insertconstrainedpoints(point *insertarray, int arylen,
 
   // Insert the points.
   for (i = 0; i < arylen; i++) {
+    if (b->addin_target_tetrahedra >= 0 &&
+        std::binary_search(b->addin_candidate_ends.begin(),
+            b->addin_candidate_ends.end(), i) &&
+        tetrahedrons->items - hullsize >= b->addin_target_tetrahedra) {
+      b->addin_stop_tetrahedra = tetrahedrons->items - hullsize;
+      break;
+    }
     // Ordinary points retain TetGen's original Bowyer-Watson insertion.
     // Declared edge points override this below so every support edge in the
     // batch is split before any Delaunay flip can remove another support.
@@ -27117,6 +27124,13 @@ void tetgenmesh::insertconstrainedpoints(point *insertarray, int arylen,
       encshlist->restart();
     }
   } // i
+  b->processed_addin_points = i;
+  // Preserve the candidate-prefix element count before deferred Lawson flips,
+  // global Delaunay recovery, and quality improvement.  When insertion stops
+  // early this is the trigger count; otherwise it is the complete input-prefix
+  // checkpoint used by the caller to calibrate the following batch.
+  if (b->addin_stop_tetrahedra < 0)
+    b->addin_stop_tetrahedra = tetrahedrons->items - hullsize;
 
   if (deferred_declared_edge_flips && flipstack != NULL) {
     flipconstraints fc;

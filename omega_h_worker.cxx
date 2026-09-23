@@ -1,6 +1,7 @@
 #include "tetgen.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -20,7 +21,7 @@
 namespace {
 
 constexpr std::uint32_t protocol_magic = 0x4f485447U;  // OHTG
-constexpr std::uint32_t protocol_version = 3;
+constexpr std::uint32_t protocol_version = 4;
 constexpr std::uint32_t command_execute = 1;
 constexpr std::uint32_t command_shutdown = 2;
 constexpr std::uint64_t maximum_items = std::uint64_t{1} << 31;
@@ -277,12 +278,31 @@ bool execute_request(int input_fd, int output_fd) {
   std::string switches;
   std::int32_t budget = 0;
   double candidate_fraction = 0.0, quality_threshold = 0.0;
+  std::int64_t target_tetrahedra = -1;
+  std::uint64_t boundary_count = 0;
+  std::vector<std::int32_t> boundaries;
   tetgenio input, addin, output;
   if (!read_string(input_fd, &switches) || !read_scalar(input_fd, &budget) ||
       !read_scalar(input_fd, &candidate_fraction) ||
       !read_scalar(input_fd, &quality_threshold) ||
+      !read_scalar(input_fd, &target_tetrahedra) ||
+      !read_scalar(input_fd, &boundary_count) ||
+      boundary_count > maximum_items ||
+      boundary_count > std::uint64_t(std::numeric_limits<int>::max()))
+    return false;
+  boundaries.resize(static_cast<std::size_t>(boundary_count));
+  if ((boundary_count && !read_exact(input_fd, boundaries.data(),
+          static_cast<std::size_t>(boundary_count) * sizeof(std::int32_t))) ||
       !read_mesh(input_fd, &input) || !read_mesh(input_fd, &addin))
     return false;
+  if (target_tetrahedra > std::numeric_limits<long>::max() ||
+      (target_tetrahedra >= 0) != !boundaries.empty() ||
+      (target_tetrahedra >= 0 &&
+          (boundaries.back() != addin.numberofpoints ||
+           boundaries.front() <= 0 ||
+           !std::is_sorted(boundaries.begin(), boundaries.end()) ||
+           std::adjacent_find(boundaries.begin(), boundaries.end()) !=
+               boundaries.end()))) return false;
   set_request_environment(budget, candidate_fraction, quality_threshold);
   std::vector<char> mutable_switches(switches.begin(), switches.end());
   mutable_switches.push_back('\0');
@@ -292,12 +312,18 @@ bool execute_request(int input_fd, int output_fd) {
     status = 1;
   } else {
     behavior.new_point_budget = budget;
+    behavior.addin_target_tetrahedra = static_cast<long>(target_tetrahedra);
+    behavior.addin_candidate_ends.assign(boundaries.begin(), boundaries.end());
     tetrahedralize(&behavior, &input, &output,
         addin.numberofpoints ? &addin : nullptr, nullptr);
   }
   return write_scalar(output_fd, protocol_magic) &&
       write_scalar(output_fd, protocol_version) &&
       write_scalar(output_fd, status) &&
+      (status || write_scalar(output_fd,
+          std::int32_t(behavior.processed_addin_points))) &&
+      (status || write_scalar(output_fd,
+          std::int64_t(behavior.addin_stop_tetrahedra))) &&
       (status || write_mesh(output_fd, output));
 }
 
