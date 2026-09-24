@@ -2699,9 +2699,15 @@ void tetgen_optimize_existing(tetgenio *in, tetgenio *out,
 //============================================================================//
 
 
-inline void terminatetetgen(tetgenmesh *m, int x)
+inline void terminatetetgen_impl(
+  tetgenmesh *m, int x, const char *file, int line)
 {
 #ifdef TETLIBRARY
+  if (getenv("TETGEN_DEBUG_TERMINATION") != NULL) {
+    fprintf(stderr, "[tetgen-termination] code=%d file=%s line=%d\n",
+      x, file, line);
+    fflush(stderr);
+  }
   throw x;
 #else
   switch (x) {
@@ -2738,6 +2744,9 @@ inline void terminatetetgen(tetgenmesh *m, int x)
   exit(x);
 #endif // #ifdef TETLIBRARY
 }
+
+#define terminatetetgen(m, x) \
+  terminatetetgen_impl((m), (x), __FILE__, __LINE__)
 
 //============================================================================//
 //                                                                            //

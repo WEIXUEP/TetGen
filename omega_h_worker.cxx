@@ -314,8 +314,20 @@ bool execute_request(int input_fd, int output_fd) {
     behavior.new_point_budget = budget;
     behavior.addin_target_tetrahedra = static_cast<long>(target_tetrahedra);
     behavior.addin_candidate_ends.assign(boundaries.begin(), boundaries.end());
-    tetrahedralize(&behavior, &input, &output,
-        addin.numberofpoints ? &addin : nullptr, nullptr);
+    // TetGen uses integer exceptions for recoverable input/topology errors.
+    // The worker is a long-lived protocol process, so let the caller receive
+    // a failed request instead of allowing the uncaught exception to become
+    // SIGABRT (which loses the actual batch reason and forces a costly retry).
+    try {
+      tetrahedralize(&behavior, &input, &output,
+          addin.numberofpoints ? &addin : nullptr, nullptr);
+    } catch (int code) {
+      std::fprintf(stderr, "TetGen request rejected with exception %d\n", code);
+      status = 2;
+    } catch (...) {
+      std::fprintf(stderr, "TetGen request rejected with unknown exception\n");
+      status = 3;
+    }
   }
   return write_scalar(output_fd, protocol_magic) &&
       write_scalar(output_fd, protocol_version) &&

@@ -15439,6 +15439,28 @@ enum tetgenmesh::interresult tetgenmesh::scoutsegment(point startpt,point endpt,
   enum interresult dir;
   int t1ver;
 
+  const bool debug_plc_intersection =
+    getenv("TETGEN_DEBUG_PLC_INTERSECTION") != NULL;
+  auto report_plc_intersection = [&](const char* kind,
+                                     enum interresult result) {
+    if (!debug_plc_intersection) return;
+    fprintf(stderr,
+      "[tetgen-plc-intersection] kind=%s result=%d segment=%d:%d "
+      "start=%.17g:%.17g:%.17g end=%.17g:%.17g:%.17g",
+      kind, (int) result, pointmark(startpt), pointmark(endpt),
+      startpt[0], startpt[1], startpt[2],
+      endpt[0], endpt[1], endpt[2]);
+    if (searchtet->tet != NULL) {
+      fprintf(stderr, " tet=%d:%d:%d:%d subseg=%d subface=%d",
+        pointmark(org(*searchtet)), pointmark(dest(*searchtet)),
+        pointmark(apex(*searchtet)), pointmark(oppo(*searchtet)),
+        issubseg(*searchtet) ? 1 : 0,
+        issubface(*searchtet) ? 1 : 0);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+  };
+
   if (b->verbose > 2) {
     printf("      Scout seg (%d, %d).\n",pointmark(startpt),pointmark(endpt));
   }
@@ -15451,12 +15473,14 @@ enum tetgenmesh::interresult tetgenmesh::scoutsegment(point startpt,point endpt,
     if (pd == endpt) {
       if (issubseg(*searchtet)) {
         //report_selfint_edge(startpt, endpt, sedge, searchtet, dir);
+        report_plc_intersection("existing_subsegment", dir);
         terminatetetgen(this, 3);
       }
       return SHAREEDGE;
     } else {
       // A point is on the path.
       //report_selfint_edge(startpt, endpt, sedge, searchtet, dir);
+      report_plc_intersection("segment_through_vertex", dir);
       terminatetetgen(this, 3);
       return ACROSSVERT;
     }
@@ -15470,6 +15494,7 @@ enum tetgenmesh::interresult tetgenmesh::scoutsegment(point startpt,point endpt,
     // Check whether two segments are intersecting.
     if (issubseg(*searchtet)) {
       //report_selfint_edge(startpt, endpt, sedge, searchtet, dir);
+      report_plc_intersection("crossed_subsegment", dir);
       terminatetetgen(this, 3);
     }
   } else if (dir == ACROSSFACE) {
@@ -15477,6 +15502,7 @@ enum tetgenmesh::interresult tetgenmesh::scoutsegment(point startpt,point endpt,
       // Check whether a segment and a subface are intersecting.
       if (issubface(*searchtet)) {
         //report_selfint_edge(startpt, endpt, sedge, searchtet, dir);
+        report_plc_intersection("crossed_subface", dir);
         terminatetetgen(this, 3);
       }
     }
@@ -15586,6 +15612,7 @@ enum tetgenmesh::interresult tetgenmesh::scoutsegment(point startpt,point endpt,
       eprev(neightet, *searchtet); 
       // dest(*searchtet) lies on the segment.
       //report_selfint_edge(startpt, endpt, sedge, searchtet, dir);
+      report_plc_intersection("walk_through_vertex", dir);
       terminatetetgen(this, 3);
       return ACROSSVERT;
     } else if (dir == ACROSSEDGE) {
@@ -15601,6 +15628,7 @@ enum tetgenmesh::interresult tetgenmesh::scoutsegment(point startpt,point endpt,
       // Check whether two segments are intersecting.
       if (issubseg(*searchtet)) {
         //report_selfint_edge(startpt, endpt, sedge, searchtet, dir);
+        report_plc_intersection("walk_crossed_subsegment", dir);
         terminatetetgen(this, 3);
       }  
     } else if (dir == ACROSSFACE) {
@@ -15608,6 +15636,7 @@ enum tetgenmesh::interresult tetgenmesh::scoutsegment(point startpt,point endpt,
         // Check whether a segment and a subface are intersecting.
         if (issubface(*searchtet)) {
           //report_selfint_edge(startpt, endpt, sedge, searchtet, dir);
+          report_plc_intersection("walk_crossed_subface", dir);
           terminatetetgen(this, 3);
         }
       }
