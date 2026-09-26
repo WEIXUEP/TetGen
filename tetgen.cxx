@@ -33371,6 +33371,8 @@ void tetgenmesh::smooth_vertices()
   point *surf_smpt_list = NULL;
   point *seg_smpt_list = NULL;
   int volcount = 0, faccount = 0, segcount = 0;
+  int volume_smooth_count = 0, surface_smooth_count = 0;
+  int segment_smooth_count = 0;
   movable_input_count = 0;
 
   // Omega_h marks reconstructed volume vertices that are strictly inside a
@@ -33378,31 +33380,61 @@ void tetgenmesh::smooth_vertices()
   // Steiner points, but are safe to include in volume smoothing because the
   // adapter freezes and validates the PLC and artificial cavity shell.
   const int movable_input_marker = -2147483000;
+  const int fixed_input_marker = -2147482999;
+  bool selective_input_smoothing = false;
   if (in->pointmarkerlist != NULL) {
     points->traversalinit();
     point ptloop = pointtraverse();
     while (ptloop != NULL) {
       int idx = pointmark(ptloop) - in->firstnumber;
-      if ((pointtype(ptloop) == VOLVERTEX ||
-           pointtype(ptloop) == NREGULARVERTEX) && idx >= 0 &&
-          idx < in->numberofpoints &&
-          in->pointmarkerlist[idx] == movable_input_marker) {
-        movable_input_count++;
+      if (idx >= 0 && idx < in->numberofpoints) {
+        int marker = in->pointmarkerlist[idx];
+        if (marker == movable_input_marker) ++movable_input_count;
+        if (marker == movable_input_marker || marker == fixed_input_marker)
+          selective_input_smoothing = true;
       }
       ptloop = pointtraverse();
     }
   }
-  int volume_smooth_count = st_volref_count + movable_input_count;
+
+  // TetGen's st_* counters include some reconstructed input vertices. Count
+  // the actual queue from point provenance instead, so a marked FREEVOLVERTEX
+  // is not double-counted and an unmarked original boundary point is never
+  // smoothed merely because TetGen assigned it a FREE* type.
+  if (selective_input_smoothing) {
+    points->traversalinit();
+    point ptcount = pointtraverse();
+    while (ptcount != NULL) {
+      int idx = pointmark(ptcount) - in->firstnumber;
+      bool input_point = idx >= 0 && idx < in->numberofpoints;
+      bool movable_input = input_point && in->pointmarkerlist != NULL &&
+          in->pointmarkerlist[idx] == movable_input_marker;
+      if (input_point) {
+        if (movable_input) ++volume_smooth_count;
+      } else if (pointtype(ptcount) == FREEVOLVERTEX) {
+        ++volume_smooth_count;
+      } else if (pointtype(ptcount) == FREEFACETVERTEX) {
+        ++surface_smooth_count;
+      } else if (pointtype(ptcount) == FREESEGVERTEX) {
+        ++segment_smooth_count;
+      }
+      ptcount = pointtraverse();
+    }
+  } else {
+    volume_smooth_count = st_volref_count;
+    surface_smooth_count = st_facref_count;
+    segment_smooth_count = st_segref_count;
+  }
 
   // Only use it when we have Steiner points.
-  if (st_segref_count > 0) {
-    seg_smpt_list = new point[st_segref_count];
+  if (segment_smooth_count > 0) {
+    seg_smpt_list = new point[segment_smooth_count];
   }
   if (volume_smooth_count > 0) {
     smpt_list = new point[volume_smooth_count];
   }
-  if (st_facref_count > 0) {
-    surf_smpt_list = new point[st_facref_count];
+  if (surface_smooth_count > 0) {
+    surf_smpt_list = new point[surface_smooth_count];
   }
 
   points->traversalinit();
@@ -33410,23 +33442,38 @@ void tetgenmesh::smooth_vertices()
   while (ptloop != NULL) {
     enum verttype vt = pointtype(ptloop);
     int idx = pointmark(ptloop) - in->firstnumber;
-    bool movable_input = (vt == VOLVERTEX || vt == NREGULARVERTEX) &&
-        in->pointmarkerlist != NULL && idx >= 0 &&
+    bool input_point = idx >= 0 && idx < in->numberofpoints;
+    bool movable_input = input_point && in->pointmarkerlist != NULL &&
         idx < in->numberofpoints &&
         in->pointmarkerlist[idx] == movable_input_marker;
-    if (vt == FREEVOLVERTEX || movable_input) {
+    bool volume_eligible = selective_input_smoothing
+        ? ((input_point && movable_input) ||
+            (!input_point && vt == FREEVOLVERTEX))
+        : (vt == FREEVOLVERTEX || movable_input);
+    if (volume_eligible) {
       smpt_list[volcount++] = ptloop;
-    } else if (vt == FREEFACETVERTEX) {
+    } else if (vt == FREEFACETVERTEX &&
+        (!selective_input_smoothing || !input_point)) {
       surf_smpt_list[faccount++] = ptloop;
-    } else if (vt == FREESEGVERTEX) {
+    } else if (vt == FREESEGVERTEX &&
+        (!selective_input_smoothing || !input_point)) {
       seg_smpt_list[segcount++] = ptloop;
     }
     ptloop = pointtraverse();
   }
 
   if ((volcount != volume_smooth_count) ||
-      (faccount != st_facref_count) ||
-      (segcount != st_segref_count)) {
+      (faccount != surface_smooth_count) ||
+      (segcount != segment_smooth_count)) {
+    if (debug_movable) {
+      fprintf(stderr,
+          "[tetgen-movable] queue-count-mismatch queued=%d expected_volume=%d "
+          "free_volume=%ld marked_input=%ld surface=%d/%d segment=%d/%d\n",
+          volcount, volume_smooth_count, st_volref_count,
+          movable_input_count, faccount, surface_smooth_count, segcount,
+          segment_smooth_count);
+      fflush(stderr);
+    }
     terminatetetgen(this, 2);
   }
 
@@ -33439,8 +33486,8 @@ void tetgenmesh::smooth_vertices()
   }
 
   if (b->verbose > 1) {
-    printf("  Smoothing (%ld, %ld) %ld vertices.\n",
-           st_segref_count, st_facref_count, st_volref_count);
+    printf("  Smoothing (%d, %d) %d vertices.\n",
+           segment_smooth_count, surface_smooth_count, volume_smooth_count);
   }
 
   // Allocate a list of target points.
@@ -33451,11 +33498,11 @@ void tetgenmesh::smooth_vertices()
   if (volume_smooth_count > 0) {
     target_list = new REAL[volume_smooth_count * 3];
   }
-  if (st_facref_count > 0) {
-    surf_target_list = new REAL[st_facref_count * 3];
+  if (surface_smooth_count > 0) {
+    surf_target_list = new REAL[surface_smooth_count * 3];
   }
-  if (st_segref_count > 0) {
-    seg_target_list = new REAL[st_segref_count * 3];
+  if (segment_smooth_count > 0) {
+    seg_target_list = new REAL[segment_smooth_count * 3];
   }
 
   long bak_flipcount = flip23count + flip32count + flip44count;
@@ -33469,11 +33516,11 @@ void tetgenmesh::smooth_vertices()
     movedcount = unmovedcount = 0;
 
     if (((b->smooth_cirterion & 4) > 0)) { // -s4, -s5, -s6, -s7, default -s3
-      //if (st_segref_count > 0) {
-      for (i = 0; i < st_segref_count; i++) {
+      //if (segment_smooth_count > 0) {
+      for (i = 0; i < segment_smooth_count; i++) {
         get_seg_laplacian_center(seg_smpt_list[i], &(seg_target_list[i*3]));
       }
-      for (i = 0; i < st_segref_count; i++) {
+      for (i = 0; i < segment_smooth_count; i++) {
         if (move_vertex(seg_smpt_list[i], &(seg_target_list[i*3]))) {
           if (later_unflip_queue->objects > b->unflip_queue_limit) {
             flipconstraints fc;
@@ -33488,11 +33535,11 @@ void tetgenmesh::smooth_vertices()
     }
 
     if (((b->smooth_cirterion & 2) > 0)) { // default -s3
-      //if (st_facref_count > 0) {
-      for (i = 0; i < st_facref_count; i++) {
+      //if (surface_smooth_count > 0) {
+      for (i = 0; i < surface_smooth_count; i++) {
         get_surf_laplacian_center(surf_smpt_list[i], &(surf_target_list[i*3]));
       }
-      for (i = 0; i < st_facref_count; i++) {
+      for (i = 0; i < surface_smooth_count; i++) {
         if (move_vertex(surf_smpt_list[i], &(surf_target_list[i*3]))) {
           if (later_unflip_queue->objects > b->unflip_queue_limit) {
             flipconstraints fc;
@@ -33577,11 +33624,11 @@ void tetgenmesh::smooth_vertices()
            flip23count + flip32count + flip44count - bak_flipcount);
   }
 
-  if (st_segref_count > 0) {
+  if (segment_smooth_count > 0) {
     delete [] seg_smpt_list;
     delete [] seg_target_list;
   }
-  if (st_facref_count > 0) {
+  if (surface_smooth_count > 0) {
     delete [] surf_target_list;
     delete [] surf_smpt_list;
   }
