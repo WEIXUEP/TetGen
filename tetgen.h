@@ -1591,7 +1591,6 @@ public:
   long duplicated_facets_count;              // Are there duplicated facets.?
   long nonregularcount;                    // Are there non-regular vertices?
   long st_segref_count, st_facref_count, st_volref_count;  // Steiner points.
-  long movable_input_count; // Whitelisted reconstructed interior inputs.
   long fillregioncount, cavitycount, cavityexpcount;
   long flip14count, flip26count, flipn2ncount;
   long flip23count, flip32count, flip44count, flip41count;
@@ -2503,7 +2502,6 @@ public:
     duplicated_facets_count = 0l;
     nonregularcount = 0l;
     st_segref_count = st_facref_count = st_volref_count = 0l;
-    movable_input_count = 0l;
     fillregioncount = cavitycount = cavityexpcount = 0l;
     flip14count = flip26count = flipn2ncount = 0l;
     flip23count = flip32count = flip44count = flip41count = 0l;
