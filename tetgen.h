@@ -2309,6 +2309,22 @@ public:
   int  get_surf_laplacian_center(point mesh_vert, REAL target[3]);
   int  get_laplacian_center(point mesh_vert, REAL target[3]);
   bool move_vertex(point mesh_vert, REAL target[3]);
+  // Segment vertices alone historically do not start the final smoothing pass.
+  bool should_smooth_vertices() const {
+    return (b->plc || b->quality) && b->smooth_maxiter > 0 &&
+        (st_volref_count > 0 || st_facref_count > 0);
+  }
+  enum verttype smoothing_vertex_type(point vertex) {
+    const int fixed_input_marker = -2147482999;
+    int idx = pointmark(vertex) - in->firstnumber;
+    if (in->pointmarkerlist != NULL && idx >= 0 &&
+        idx < in->numberofpoints &&
+        in->pointmarkerlist[idx] == fixed_input_marker)
+      return UNUSEDVERTEX;
+    enum verttype vt = pointtype(vertex);
+    return vt == FREEVOLVERTEX || vt == FREEFACETVERTEX ||
+        vt == FREESEGVERTEX ? vt : UNUSEDVERTEX;
+  }
   void smooth_vertices();
 
   bool get_tet(point, point, point, point, triface *);

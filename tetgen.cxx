@@ -33373,24 +33373,14 @@ void tetgenmesh::smooth_vertices()
   int volcount = 0, faccount = 0, segcount = 0;
   int volume_smooth_count = 0, surface_smooth_count = 0;
   int segment_smooth_count = 0;
-  const int fixed_input_marker = -2147482999;
-  auto is_fixed_input = [&](point vertex) {
-    int idx = pointmark(vertex) - in->firstnumber;
-    return in->pointmarkerlist != NULL && idx >= 0 &&
-        idx < in->numberofpoints &&
-        in->pointmarkerlist[idx] == fixed_input_marker;
-  };
-
-  // Count the actual native FREE* queues, excluding only explicit CAD locks.
+  // PLC retains the native FREE* queues; CAD only adds explicit input locks.
   points->traversalinit();
   point ptloop = pointtraverse();
   while (ptloop != NULL) {
-    if (!is_fixed_input(ptloop)) {
-      enum verttype vt = pointtype(ptloop);
-      if (vt == FREEVOLVERTEX) ++volume_smooth_count;
-      else if (vt == FREEFACETVERTEX) ++surface_smooth_count;
-      else if (vt == FREESEGVERTEX) ++segment_smooth_count;
-    }
+    enum verttype vt = smoothing_vertex_type(ptloop);
+    if (vt == FREEVOLVERTEX) ++volume_smooth_count;
+    else if (vt == FREEFACETVERTEX) ++surface_smooth_count;
+    else if (vt == FREESEGVERTEX) ++segment_smooth_count;
     ptloop = pointtraverse();
   }
 
@@ -33404,12 +33394,10 @@ void tetgenmesh::smooth_vertices()
   points->traversalinit();
   ptloop = pointtraverse();
   while (ptloop != NULL) {
-    if (!is_fixed_input(ptloop)) {
-      enum verttype vt = pointtype(ptloop);
-      if (vt == FREEVOLVERTEX) smpt_list[volcount++] = ptloop;
-      else if (vt == FREEFACETVERTEX) surf_smpt_list[faccount++] = ptloop;
-      else if (vt == FREESEGVERTEX) seg_smpt_list[segcount++] = ptloop;
-    }
+    enum verttype vt = smoothing_vertex_type(ptloop);
+    if (vt == FREEVOLVERTEX) smpt_list[volcount++] = ptloop;
+    else if (vt == FREEFACETVERTEX) surf_smpt_list[faccount++] = ptloop;
+    else if (vt == FREESEGVERTEX) seg_smpt_list[segcount++] = ptloop;
     ptloop = pointtraverse();
   }
 
@@ -41125,20 +41113,14 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
     }
   }
 
-  if ((b->plc || b->quality) &&
-      (b->smooth_maxiter > 0) &&
-      ((m.st_volref_count > 0) || (m.st_facref_count > 0) ||
-          (m.st_segref_count > 0))) {
+  if (m.should_smooth_vertices()) {
     m.smooth_vertices(); // m.optimizemesh(ts[0]);
   }
 
   tv[10] = clock();
 
   if (!b->quiet) {
-    if ((b->plc || b->quality) &&
-        (b->smooth_maxiter > 0) &&
-        ((m.st_volref_count > 0) || (m.st_facref_count > 0) ||
-            (m.st_segref_count > 0))) {
+    if (m.should_smooth_vertices()) {
       printf("Mesh smoothing seconds:  %g\n", ((REAL)(tv[10] - tv[9])) / cps);
     }
   }

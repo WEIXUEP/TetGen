@@ -166,6 +166,9 @@ option(TETGEN_ENABLE_TESTING "Enable CTest testing for TetGen" OFF)
 # avoiding unnecessary setup otherwise.
 if(TETGEN_ENABLE_TESTING)
   include(CTest)
+  add_executable(tetgen_smoothing_policy_test smoothing_policy_test.cxx)
+  target_link_libraries(tetgen_smoothing_policy_test PRIVATE tet)
+  add_test(NAME tetgen/smoothing_policy COMMAND tetgen_smoothing_policy_test)
 endif()
 
 # --- Configurable options ---------------------------------------------------
