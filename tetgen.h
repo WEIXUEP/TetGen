@@ -83,6 +83,8 @@
 #include <time.h>
 #include <stdint.h>
 #include <vector>
+#include <array>
+#include <set>
 #include <iomanip>
 #include <fstream>
 #include <iostream>
@@ -633,6 +635,10 @@ public:
   int refine;                                                      // '-r', 0.
   int quality;                                                     // '-q', 0.
   int nobisect;                                                    // '-Y', 0.
+  bool selective_plc_surface_flip = false;
+  std::vector<int> required_plc_points;
+  std::vector<int> required_plc_edges;
+  std::vector<int> required_plc_facets;
   int cdt;                                                         // '-D', 0.
   int cdtrefine;                                                  // '-D#', 7.
   int coarsen;                                                     // '-R', 0.
@@ -1444,6 +1450,9 @@ public:
 
   // Pointer to the switches and parameters.
   tetgenbehavior *b;
+  std::set<std::array<int, 3>> required_surface_faces;
+  std::set<std::array<int, 2>> required_surface_edges;
+  bool is_required_surface_face(face& s);
 
   // Pointer to a background mesh (contains size specification map).
   tetgenmesh *bgm;

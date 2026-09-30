@@ -21,7 +21,7 @@
 namespace {
 
 constexpr std::uint32_t protocol_magic = 0x4f485447U;  // OHTG
-constexpr std::uint32_t protocol_version = 4;
+constexpr std::uint32_t protocol_version = 7;
 constexpr std::uint32_t command_execute = 1;
 constexpr std::uint32_t command_shutdown = 2;
 constexpr std::uint64_t maximum_items = std::uint64_t{1} << 31;
@@ -117,20 +117,22 @@ bool read_string(int fd, std::string* value) {
 bool read_mesh(int fd, tetgenio* mesh) {
   std::int32_t first = 0, points = 0, tets = 0, corners = 0;
   std::int32_t attributes = 0, faces = 0, edges = 0, plc_facets = 0;
-  std::int32_t regions = 0;
+  std::int32_t plc_quad_count = 0;
+  std::int32_t regions = 0, holes = 0;
   std::uint8_t point_markers = 0, point_origins = 0, edge_supports = 0;
   std::uint8_t face_markers = 0, edge_markers = 0, plc_markers = 0;
   if (!read_scalar(fd, &first) || !read_scalar(fd, &points) ||
       !read_scalar(fd, &tets) || !read_scalar(fd, &corners) ||
       !read_scalar(fd, &attributes) || !read_scalar(fd, &faces) ||
       !read_scalar(fd, &edges) || !read_scalar(fd, &plc_facets) ||
+      !read_scalar(fd, &plc_quad_count) ||
       !read_scalar(fd, &regions) || !read_scalar(fd, &point_markers) ||
       !read_scalar(fd, &point_origins) || !read_scalar(fd, &face_markers) ||
       !read_scalar(fd, &edge_markers) || !read_scalar(fd, &edge_supports) ||
       !read_scalar(fd, &plc_markers))
     return false;
   if (points < 0 || tets < 0 || faces < 0 || edges < 0 || corners < 0 ||
-      attributes < 0 || plc_facets < 0 || regions < 0)
+      attributes < 0 || plc_facets < 0 || plc_quad_count < 0 || regions < 0)
     return false;
   mesh->firstnumber = first;
   mesh->mesh_dim = 3;
@@ -143,6 +145,8 @@ bool read_mesh(int fd, tetgenio* mesh) {
   REAL* point_origin_values = nullptr;
   int* edge_support_values = nullptr;
   int* plc_triangles = nullptr;
+  int* plc_quads = nullptr;
+  int* plc_quad_markers = nullptr;
   auto const arrays_ok = read_array(fd, &mesh->pointlist,
           std::uint64_t(points) * 3) &&
       (!point_markers || read_array(fd, &mesh->pointmarkerlist, points)) &&
@@ -160,11 +164,17 @@ bool read_mesh(int fd, tetgenio* mesh) {
       read_array(fd, &plc_triangles, std::uint64_t(plc_facets) * 3) &&
       (!plc_markers || read_array(
           fd, &mesh->facetmarkerlist, plc_facets)) &&
-      read_array(fd, &mesh->regionlist, std::uint64_t(regions) * 5);
+      read_array(fd, &plc_quads, std::uint64_t(plc_quad_count) * 4) &&
+      read_array(fd, &plc_quad_markers, plc_quad_count) &&
+      read_array(fd, &mesh->regionlist, std::uint64_t(regions) * 5) &&
+      read_scalar(fd, &holes) && holes >= 0 &&
+      read_array(fd, &mesh->holelist, std::uint64_t(holes) * 3);
   if (!arrays_ok) {
     delete[] point_origin_values;
     delete[] edge_support_values;
     delete[] plc_triangles;
+    delete[] plc_quads;
+    delete[] plc_quad_markers;
     return false;
   }
   mesh->numberofpointattributes = edge_supports ? 3 :
@@ -186,24 +196,36 @@ bool read_mesh(int fd, tetgenio* mesh) {
   }
   delete[] point_origin_values;
   delete[] edge_support_values;
-  mesh->numberoffacets = plc_facets;
+  mesh->numberoffacets = plc_facets + plc_quad_count;
   mesh->numberofregions = regions;
-  if (plc_facets) {
-    mesh->facetlist = new tetgenio::facet[plc_facets];
-    for (int facet = 0; facet < plc_facets; ++facet) {
+  mesh->numberofholes = holes;
+  if (mesh->numberoffacets) {
+    mesh->facetlist = new tetgenio::facet[mesh->numberoffacets];
+    auto* markers = mesh->facetmarkerlist;
+    mesh->facetmarkerlist = new int[mesh->numberoffacets];
+    for (int facet = 0; facet < mesh->numberoffacets; ++facet) {
+      auto const quad = facet >= plc_facets;
+      auto const index = quad ? facet - plc_facets : facet;
+      auto const corners = quad ? 4 : 3;
+      mesh->facetmarkerlist[facet] = quad ?
+          plc_quad_markers[index] : markers[index];
       auto& f = mesh->facetlist[facet];
       f.numberofpolygons = 1;
       f.polygonlist = new tetgenio::polygon[1];
       f.numberofholes = 0;
       f.holelist = nullptr;
-      f.polygonlist[0].numberofvertices = 3;
-      f.polygonlist[0].vertexlist = new int[3];
-      for (int corner = 0; corner < 3; ++corner)
-        f.polygonlist[0].vertexlist[corner] =
-            plc_triangles[3 * facet + corner];
+      f.polygonlist[0].numberofvertices = corners;
+      f.polygonlist[0].vertexlist = new int[corners];
+      for (int corner = 0; corner < corners; ++corner)
+        f.polygonlist[0].vertexlist[corner] = quad ?
+            plc_quads[4 * index + corner] :
+            plc_triangles[3 * index + corner];
     }
+    delete[] markers;
   }
   delete[] plc_triangles;
+  delete[] plc_quads;
+  delete[] plc_quad_markers;
   return true;
 }
 
@@ -225,6 +247,7 @@ bool write_mesh(int fd, tetgenio const& mesh) {
       write_scalar(fd, std::int32_t(mesh.numberoftrifaces)) &&
       write_scalar(fd, std::int32_t(mesh.numberofedges)) &&
       write_scalar(fd, std::int32_t(0)) && write_scalar(fd, std::int32_t(0)) &&
+      write_scalar(fd, std::int32_t(0)) &&
       write_scalar(fd, point_markers) && write_scalar(fd, point_origins) &&
       write_scalar(fd, face_markers) && write_scalar(fd, edge_markers) &&
       write_scalar(fd, edge_supports) &&
@@ -251,7 +274,8 @@ bool write_mesh(int fd, tetgenio const& mesh) {
           fd, mesh.trifacemarkerlist, mesh.numberoftrifaces)) &&
       write_array(fd, mesh.edgelist, std::uint64_t(mesh.numberofedges) * 2) &&
       (!edge_markers || write_array(
-          fd, mesh.edgemarkerlist, mesh.numberofedges));
+          fd, mesh.edgemarkerlist, mesh.numberofedges)) &&
+      write_scalar(fd, std::int32_t(0));
 }
 
 void set_request_environment(
@@ -281,6 +305,9 @@ bool execute_request(int input_fd, int output_fd) {
   std::int64_t target_tetrahedra = -1;
   std::uint64_t boundary_count = 0;
   std::vector<std::int32_t> boundaries;
+  std::uint8_t selective = 0;
+  std::uint64_t required_points = 0, required_edges = 0, required_facets = 0;
+  std::vector<int> protected_points, protected_edges, protected_facets;
   tetgenio input, addin, output;
   if (!read_string(input_fd, &switches) || !read_scalar(input_fd, &budget) ||
       !read_scalar(input_fd, &candidate_fraction) ||
@@ -293,8 +320,24 @@ bool execute_request(int input_fd, int output_fd) {
   boundaries.resize(static_cast<std::size_t>(boundary_count));
   if ((boundary_count && !read_exact(input_fd, boundaries.data(),
           static_cast<std::size_t>(boundary_count) * sizeof(std::int32_t))) ||
-      !read_mesh(input_fd, &input) || !read_mesh(input_fd, &addin))
+      !read_mesh(input_fd, &input) || !read_mesh(input_fd, &addin) ||
+      !read_scalar(input_fd, &selective) ||
+      !read_scalar(input_fd, &required_points) ||
+      !read_scalar(input_fd, &required_edges) ||
+      !read_scalar(input_fd, &required_facets) ||
+      required_points > maximum_items || required_edges > maximum_items ||
+      required_facets > maximum_items ||
+      required_edges % 2 != 0 || required_facets % 3 != 0)
     return false;
+  protected_points.resize(static_cast<std::size_t>(required_points));
+  protected_edges.resize(static_cast<std::size_t>(required_edges));
+  protected_facets.resize(static_cast<std::size_t>(required_facets));
+  if ((required_points && !read_exact(input_fd, protected_points.data(),
+          protected_points.size() * sizeof(int))) ||
+      (required_edges && !read_exact(input_fd, protected_edges.data(),
+          protected_edges.size() * sizeof(int))) ||
+      (required_facets && !read_exact(input_fd, protected_facets.data(),
+          protected_facets.size() * sizeof(int)))) return false;
   if (target_tetrahedra > std::numeric_limits<long>::max() ||
       (target_tetrahedra >= 0) != !boundaries.empty() ||
       (target_tetrahedra >= 0 &&
@@ -312,6 +355,10 @@ bool execute_request(int input_fd, int output_fd) {
     status = 1;
   } else {
     behavior.new_point_budget = budget;
+    behavior.selective_plc_surface_flip = selective != 0;
+    behavior.required_plc_points = std::move(protected_points);
+    behavior.required_plc_edges = std::move(protected_edges);
+    behavior.required_plc_facets = std::move(protected_facets);
     behavior.addin_target_tetrahedra = static_cast<long>(target_tetrahedra);
     behavior.addin_candidate_ends.assign(boundaries.begin(), boundaries.end());
     // TetGen uses integer exceptions for recoverable input/topology errors.

@@ -48,6 +48,7 @@
 #include <climits>
 #include <cfloat>
 #include <algorithm>
+#include <array>
 #include <vector>
 
 static void tetgen_read_r2_controls(tetgenbehavior* b)
@@ -8723,11 +8724,20 @@ int tetgenmesh::flipnm(triface* abtets, int n, int level, int abedgepivot,
           esymself(flipedge); 
           // Count the number of tets at the edge.
           int subface_count = 0;
+          bool touches_required_surface = false;
           n1 = 0;
           j = 0; // Sum of the star counters.
           spintet = flipedge;
           while (1) {
-            if (issubface(spintet)) subface_count++;
+            if (issubface(spintet)) {
+              subface_count++;
+              if (b->selective_plc_surface_flip) {
+                face surface;
+                tspivot(spintet, surface);
+                touches_required_surface = touches_required_surface ||
+                    (surface.sh != NULL && is_required_surface_face(surface));
+              }
+            }
             n1++;
             j += (elemcounter(spintet)); 
             fnextself(spintet);
@@ -8743,6 +8753,7 @@ int tetgenmesh::flipnm(triface* abtets, int n, int level, int abedgepivot,
             continue; // Do not flip this edge.
           }
 
+          if (touches_required_surface) continue;
           if (fc->noflip_in_surface) {
             if (subface_count > 0) {
               continue;
@@ -19341,7 +19352,15 @@ int tetgenmesh::removeedgebyflips(triface *flipedge, flipconstraints* fc)
   n = 0;
   spintet = *flipedge;
   while (1) {
-    if (issubface(spintet)) subface_count++;
+    if (issubface(spintet)) {
+      subface_count++;
+      if (b->selective_plc_surface_flip) {
+        face protected_face;
+        tspivot(spintet, protected_face);
+        if (protected_face.sh != NULL &&
+            is_required_surface_face(protected_face)) return 0;
+      }
+    }
     n++;
     fnextself(spintet);
     if (spintet.tet == flipedge->tet) break;
@@ -35690,10 +35709,20 @@ long tetgenmesh::repair_batch_slivers()
 //                                                                            //
 //============================================================================//
 
+bool tetgenmesh::is_required_surface_face(face& surface)
+{
+  if (!b->selective_plc_surface_flip) return false;
+  std::array<int, 3> vertices{{pointmark(sorg(surface)),
+      pointmark(sdest(surface)), pointmark(sapex(surface))}};
+  std::sort(vertices.begin(), vertices.end());
+  return required_surface_faces.count(vertices) != 0;
+}
+
 long tetgenmesh::improve_surface_triangulation()
 {
   int t1ver;
-  if (b->nobisect || ((b->cdtrefine & 2) == 0) ||
+  if ((b->nobisect && !b->selective_plc_surface_flip) ||
+      ((b->cdtrefine & 2) == 0) ||
       ((b->opt_scheme & 4) == 0)) {
     return 0;
   }
@@ -35759,6 +35788,18 @@ long tetgenmesh::improve_surface_triangulation()
         spivot(shloop, neighsh);
         if (neighsh.sh == NULL || neighsh.sh == shloop.sh ||
             shellmark(neighsh) != shellmark(shloop)) {
+          senextself(shloop);
+          continue;
+        }
+        if (is_required_surface_face(shloop) ||
+            is_required_surface_face(neighsh)) {
+          senextself(shloop);
+          continue;
+        }
+        std::array<int, 2> flip_key{{pointmark(sorg(shloop)),
+            pointmark(sdest(shloop))}};
+        std::sort(flip_key.begin(), flip_key.end());
+        if (required_surface_edges.count(flip_key)) {
           senextself(shloop);
           continue;
         }
@@ -40790,6 +40831,25 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
   m.b = b;
   m.in = in;
   m.addin = addin;
+  if (b->selective_plc_surface_flip) {
+    if (!b->plc || !b->nobisect ||
+        b->required_plc_facets.size() % 3 != 0 ||
+        b->required_plc_edges.size() % 2 != 0)
+      terminatetetgen(&m, 3);
+    for (size_t i = 0; i < b->required_plc_facets.size(); i += 3) {
+      std::array<int, 3> face{{b->required_plc_facets[i],
+          b->required_plc_facets[i + 1], b->required_plc_facets[i + 2]}};
+      std::sort(face.begin(), face.end());
+      if (!m.required_surface_faces.insert(face).second)
+        terminatetetgen(&m, 3);
+    }
+    for (size_t i = 0; i < b->required_plc_edges.size(); i += 2) {
+      std::array<int, 2> edge{{b->required_plc_edges[i],
+          b->required_plc_edges[i + 1]}};
+      std::sort(edge.begin(), edge.end());
+      m.required_surface_edges.insert(edge);
+    }
+  }
 
   if (b->metric && bgmin && (bgmin->numberofpoints > 0)) {
     m.bgm = new tetgenmesh(); // Create an empty background mesh.
@@ -40940,6 +41000,22 @@ void tetrahedralize(tetgenbehavior *b, tetgenio *in, tetgenio *out,
       return;
     }
 
+    if (b->selective_plc_surface_flip) {
+      std::set<std::array<int, 3>> recovered;
+      m.subfaces->traversalinit();
+      tetgenmesh::face surface;
+      surface.shver = 0;
+      surface.sh = m.shellfacetraverse(m.subfaces);
+      while (surface.sh != NULL) {
+        std::array<int, 3> vertices{{m.pointmark(m.sorg(surface)),
+            m.pointmark(m.sdest(surface)), m.pointmark(m.sapex(surface))}};
+        std::sort(vertices.begin(), vertices.end());
+        if (m.required_surface_faces.count(vertices)) recovered.insert(vertices);
+        surface.sh = m.shellfacetraverse(m.subfaces);
+      }
+      if (recovered != m.required_surface_faces)
+        terminatetetgen(&m, 201);
+    }
     m.carveholes();
 
     ts[2] = clock();
