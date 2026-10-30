@@ -8754,7 +8754,7 @@ int tetgenmesh::flipnm(triface* abtets, int n, int level, int abedgepivot,
           }
 
           if (touches_required_surface) continue;
-          if (fc->noflip_in_surface) {
+          if (fc->noflip_in_surface || b->nobisect) {
             if (subface_count > 0) {
               continue;
             }
@@ -19370,7 +19370,7 @@ int tetgenmesh::removeedgebyflips(triface *flipedge, flipconstraints* fc)
     terminatetetgen(this, 2); // Report a bug
   }
 
-  if (fc->noflip_in_surface) {
+  if (fc->noflip_in_surface || b->nobisect) {
     if (subface_count > 0) {
       if (r2_candidate_diagnostics_active)
         r2_topology_rejections++;
@@ -32533,6 +32533,10 @@ long tetgenmesh::lawsonflip3d(flipconstraints *fc)
 
       fsym(fliptets[0], fliptets[1]);
       if (ishulltet(fliptets[1])) {
+        // A hull-sliver peel changes the piecewise-linear boundary even when
+        // every surviving tet is positive. Respect -Y and the caller's frozen
+        // surface constraint, just as generalized edge removal does.
+        if (b->nobisect || fc->noflip_in_surface) continue;
         if (nonconvex) {
           // Check if 'fliptets[0]' it is a hull sliver.
           tspivot(fliptets[0], checksh);
@@ -32696,6 +32700,12 @@ long tetgenmesh::lawsonflip3d(flipconstraints *fc)
             if (issubface(fliptets[i])) scount++;
             fnext(fliptets[i], fliptets[i+1]);
           }
+          // 3-to-2 / 4-to-4 flips across subfaces retriangulate the surface.
+          // In a noncoplanar quad this silently gains/loses a thin volume.
+          // Mandatory ONEDGE splits are handled separately by insertpoint;
+          // freezing these subsequent flips does not prohibit those splits.
+          if ((b->nobisect || fc->noflip_in_surface) &&
+              (scount > 0 || issubface(fliptets[3]))) continue;
           if (fliptets[3].tet == fliptets[0].tet) {
             // A 3-2 flip is found. "scount" must be either 0 or 2.
             if (scount == 1) {
